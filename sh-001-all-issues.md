@@ -175,7 +175,7 @@ K8s：v1.32.13
 
 1. 安装 Ascend Docker Runtime（升级到 v26.1.0.beta.2 匹配 Device Plugin）
 2. 部署 Device Plugin DaemonSet（volcanoType=true, presetVirtualDevice=true）
-3. 部署 NodeD DaemonSet
+3. 安装 volcano 昇腾插件
 
 ### 3.4 接入 K8s
 
@@ -236,6 +236,30 @@ K8s：v1.32.13
 
 **解决**：ConfigMap 加 hostPath `/usr/lib64` → `/usr/lib64`。
 
+##### 8. 安装 Device Plugin 之后报DCMI一直重试错误
+
+**现象**：安装 Device Plugin 插件之后报DCMI一直重试错误
+
+**根因**：最新版本对A5机器仍缺乏某些配置
+
+**解决**：联系mindclust 同事排查，补上三个点的对应缺失参数。
+
+##### 9. volcano 调度器无法使用
+
+**现象**：切换volcano调度器之后，runner无法正常调起workflow pod/workflow pod一直pending
+
+**根因**：volcano调度器对A5机器适配问题
+
+**解决**：联系mindclust 同事排查，需要再configmap 加上annotation的key。
+
+##### 10. 云下机器无法连接外网
+
+**现象**：云下机器链接外网完全不通
+
+**根因**：etc/reolve.conf 只包含他们内网的地址，无法解析外网地址
+
+**解决**：etc/reolve.conf 增加公网地址。
+
 ---
 
 ## 四、云上云下网络联通与 CNI 修复
@@ -258,7 +282,7 @@ K8s：v1.32.13
 
 **问题**：问题是 4.1 的衍生。CoreDNS ClusterIP `10.96.0.10` 被 kube-proxy DNAT 到 master-03 的 pod（`10.0.3.x`），DNS 包走 master-02 上 `10.0.3.0/24 via 10.254.1.25 dev eth1` 这条指向旧管理 IP 的死路由，**绕过 Cilium 被丢**。
 
-**现象**：pod 内 `dig @10.96.0.10 baidu.com` 超时；`dig @10.0.3.202 baidu.com` 超时；所有业务域名无法解析。
+**现象**：pod 内 `dig @10.96.0.10 baidu.com` 超时；`dig @10.0.3.202 baidu.com` 超时；所有业务域名无法解析。listener无法调度runner/runner一直在空运行
 
 **修复**：随 4.1 一并修复——删死路由 + 切 tunnel + 重启 cilium，DNS 流量回归 Cilium 数据面。
 
@@ -328,59 +352,13 @@ Pod → CoreDNS ClusterIP (10.96.0.10)    [断裂点1]
 ---
 
 ## 五、后续维护
+### 5.1 openeuler和容器ubuntu的C运行时库不兼容
 
-### 5.1 GitOps 接入
+**现象**：openeuler镜像可通过npusmi-info查看npu信息，但ubuntu镜像不行。
 
-1. ci-deployment 仓库新建 `projects/vllm-project/vllm-ascend/config-shanghai/` 和 `linux-aarch64-950dt-{2,4,8}-shanghai/`
-2. 新建 `argocd/clusters/shanghai-001/vllm-ascend.yaml`
-3. values.yaml 从 A3-8 直接复制，仅改 3 处标签（避免手工编辑格式偏差）
-4. 提 PR 合入 + ArgoCD 注册集群
+**根因**：openeuler和容器ubuntu的C运行时库不兼容。
 
-### 5.2 Service 迁移
+**解决**：把ascend950DT的驱动库打包进ubuntu经i选哪个
 
-1. 新增 admin123（192.168.13.107）作为服务节点
-2. 迁移 resource-api、ARC controller、listeners、secrets-manager、imagepullsecret-patcher
-3. 部署 nginx-pypi-cache
-4. PVC 改 hostPath（无 storage provisioner）
 
-### 5.3 Runner Scale Set
 
-1. 安装 ARC Controller 0.14.2
-2. 部署 listener + runner scale set（`linux-aarch64-950dt-{2,4,8}`）
-3. 验证 runner 接 GitHub job 成功完成
-
-**注意**：每次 Helm 重装会向 GitHub 注册新 scale set ID，旧 job 会孤儿。确认配置后只装一次不再卸载。
-
-### 5.4 遗留事项
-
-| # | 事项 | 优先级 |
-|---|------|:--:|
-| 1 | ArgoCD 注册集群 + PR 合入，纳入 GitOps | 高 |
-| 2 | lab 节点 NTP 永久配置 | 中 |
-| 3 | Volcano + Device Plugin + NodeD 完整部署 | 中 |
-
----
-
-## 附录 A：排查模式速查
-
-| 排查模式 | 适用场景 |
-|----------|----------|
-| DNS 链路分段验证（Pod→CoreDNS→上游→回包） | 任何 Pod 内网络不通 |
-| 证书 SAN 列表必须完整，修改后三台 master 都需重新生成+重启 | 添加新入口 IP |
-| 时钟偏差 → JIT token nbf 校验失败 | Runner 无限循环创建 |
-| Helm 重装 → scale set ID 变化 | GitHub job 永远 queued |
-| Docker Registry `/v2/` 返回 401 = 正常认证流程 | 误判为镜像仓库故障 |
-| OpenEuler 与 Ubuntu 差异 | 云下节点部署 |
-| VPN 拓扑优先 tunnel 模式而非 native | CNI 选型 |
-| pod→master 不通先查出口是否有 SNAT | 混合网络排查 |
-
-## 附录 B：关键架构决策
-
-| 决策 | 原因 |
-|------|------|
-| Cilium routing-mode 从 native 切 tunnel | VPN 跨站 + 多网卡 + native device 探测失败 |
-| 在 worker 上加 iptables SNAT 而非依赖 Cilium masquerade | IPsec 网关只认节点网段，pod 源 IP 被丢 |
-| kube-proxy-replacement=false | BPF Service 路由在 Cilium 异常时不可靠 |
-| 证书包含所有节点 IP + 两个 ELB IP | 避免多入口 TLS 失败 |
-| values.yaml 100% 从 A3 复制 | 最小化差异，杜绝格式错误 |
-| Helm 只装一次 | 避免 scale set ID 变化孤儿 job |
