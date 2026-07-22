@@ -1,4 +1,16 @@
-# Shanghai Cluster (openmerlin-shanghai-001) 部署手册
+# 华为云 + 线下 + VPN K8s 集群问题汇总
+
+> 集群：3 master（Ubuntu 22.04 x86_64）+ 4 worker（openEuler 24.03, aarch64, VPN 接入）+ 1 服务节点 admin123（Ubuntu 22.04, x86_64, VPN 接入）
+<br>
+CNI：Cilium（tunnel / VXLAN 模式）
+<br>
+K8s：v1.32.13
+<br>
+处理时间：2026-07-16 ~ 2026-07-22
+<br>
+状态：**所有问题均已修复并验证**
+
+---
 
 ## 集群架构
 
@@ -12,17 +24,30 @@
 
 | 网段 | 接口 | 用途 |
 |------|------|------|
-| 10.254.1.0/24 | eth1（master）/ enp34s0f1（lab） | 管理面 |
-| 10.254.9.0/24 | eth0（master） | 服务面 |
+| 10.254.1.0/24 | eth1（master）/ enp34s0f1（lab） | 管理面 — kube-apiserver、etcd |
+| 10.254.9.0/24 | eth0（master） | 服务面 — Cilium pod 网络 |
 | 192.168.8.0/21 | enp34s0f1（lab） | 云下面管理 |
 | 178.27.0.0/18 | data0（lab） | 云下面数据、NFS |
 
-**ELB**：
+**ELB**：管理面 `115.175.0.82:6443`（内 `10.254.1.33`），服务面 `10.254.9.147:6443`。
 
-| ELB | 地址 | 用途 |
-|-----|------|------|
-| 管理面 | `115.175.0.82:6443`（内 `10.254.1.33`） | 对外 API server |
-| 服务面 | `10.254.9.147:6443` | Pod 内部访问 |
+**VPN**：IPsec 站点间 VPN，仅放行节点网段（10.254.9.0/24 ↔ 192.168.8.0/21），**不放行 Pod 网段**。
+
+---
+
+## 总览
+
+| # | 问题 | 根因 | 修复 | 状态 |
+|---|------|------|------|:--:|
+| 1 | 跨节点 Pod 路由不通 | 业务面切换不彻底，遗留指向旧管理 IP 的死路由 | 删旧路由 + 切 Cilium tunnel | Done |
+| 2 | CoreDNS 无法解析 | DNS 流量走遗留死路由被丢 | 修复路由后自愈 | Done |
+| 3 | Pod→master 节点 IP 不通 | pod 源 IP 裸送 underlay，IPsec 网关不认，缺 SNAT | 加 iptables SNAT 并持久化 | Done |
+| 4 | Cilium worker CrashLoop | native 模式在 VPN+多网卡环境探测 device 失败 | 切 tunnel 模式 | Done |
+| 5 | 证书不含 ELB IP | kubeadm init 时仅含 control-plane-endpoint | 补全 certSANs + 重新生成证书 | Done |
+| 6 | Lab 节点时钟偏差 8h | openEuler 系统时间未同步 | date 同步 + 待配 NTP | Done |
+| 7 | Runner JIT token 校验失败 | 时钟偏差导致 token nbf 在未来 | 修复时钟后自愈 | Done |
+| 8 | Lab 节点 containerd/系统差异 | OpenEuler vs Ubuntu 的 systemd-resolved、containerd v1.6 | 适配配置 | Done |
+| 9 | DevOps 流程与配置管理 | 反复重装致 scale set ID 变化、values.yaml 格式 | GitOps + 对齐 A3 模板 | Done |
 
 ---
 
@@ -58,31 +83,30 @@
 
 **根因**：路由器回程子网段与云上服务面网段重复，都在 `10.0.9.0/24`。回程路由找到多条匹配，导致回包错误路由。
 
-**解决**：切换为 `10.254.9.0/24` 网段后回程路由唯一，得以解决。
+**解决**：切换为 `10.254.9.0/24` 网段后回程路由唯一，问题解决。
 
 ---
 
 ## 二、云上搭建 K8s
 
-### 2.1 云上搭建 K8s 集群
+### 2.1 K8s 集群初始化
 
-1. 三台 master 节点执行系统准备（hostname、swap off、kernel modules、sysctl）
-2. 安装 containerd v2.2.6，配置 SystemdCgroup + 阿里云镜像加速（`registry.aliyuncs.com/google_containers`）
-3. `kubeadm init`：API server 绑定管理面 IP `10.254.1.187`，control-plane-endpoint 同地址
-4. 安装 Cilium CNI（native routing + BPF masquerade + NodePort）
+1. 三台 master 节点系统准备（hostname、swap off、kernel modules、sysctl）
+2. 安装 containerd v2.2.6，配置 SystemdCgroup + 阿里云镜像加速
+3. `kubeadm init`：API server 绑定管理面 IP `10.254.1.187`
+4. 安装 Cilium CNI（最终采用 tunnel/VXLAN 模式，见第四节）
 5. 加入 master-02/03 作为 control-plane 节点
-6. 安装 ARC Controller（actions-runner-controller 0.14.2）
 
-### 2.2 安装组件服务
+### 2.2 组件服务安装
 
-1. 部署 resource-api（FastAPI）和 vue-frontend（Vue.js + Nginx）到 arc-system namespace
-2. 安装 resource-deploy-core 仓库的前后端镜像
+1. 部署 resource-api（FastAPI）和 vue-frontend（Vue.js + Nginx），arc-system namespace
+2. 安装 ARC Controller（actions-runner-controller 0.14.2）
 
 ### 2.3 证书与 ELB 配置
 
-1. 更新 kubeadm-config，将管理面 ELB `115.175.0.82` 和服务面 ELB `10.254.9.147` 加入 certSANs
+1. 将所有需要访问 API server 的 IP（管理面、服务面、ELB）加入 `apiServer.certSANs`
 2. 三台 master 重新生成 API server 证书并重启
-3. 更新 cluster-info ConfigMap 和 kube-proxy ConfigMap 的 server 地址为 ELB
+3. 更新 cluster-info 和 kube-proxy ConfigMap 中的 server 地址为 ELB
 
 ---
 
@@ -92,49 +116,41 @@
 
 **现象**：Pod 实际分配 IP 为 `10.0.x.x`，而非 kubeadm 指定的 `10.244.0.0/16`。
 
-**根因**：Cilium 默认 `cluster-pool-ipv4-cidr: 10.0.0.0/8`，kubeadm 的 `--pod-network-cidr` 只影响 kube-proxy 和 CoreDNS，Cilium 自身 IPAM 不受其控制。
+**根因**：Cilium 默认 `cluster-pool-ipv4-cidr: 10.0.0.0/8`，不受 kubeadm `--pod-network-cidr` 控制。
 
-**解决**：将 `ipv4-native-routing-cidr` 设为 `10.0.0.0/8` 与实际 Pod IP 段对齐。
+**解决**：后续配置（如 masquerade、routing 规则）均以 Cilium 实际使用的 `10.0.0.0/8` 为准。
 
----
+##### 2. 证书不含 ELB IP 致 TLS 验证失败
 
-##### 2. Flannel CNI 残留冲突
+**现象**：lab 节点 `kubeadm join` 报 `x509: certificate is valid for ..., not 10.254.9.147`。
 
-**现象**：CoreDNS pod 创建失败，日志 `plugin type="flannel" failed: open /run/flannel/subnet.env: no such file or directory`。
+**根因**：kubeadm init 时证书仅含 control-plane-endpoint 指定的 IP。
 
-**根因**：旧集群的 flannel CNI 配置文件存在于 `/etc/cni/net.d/`，kubelet 在 Cilium 写入其 CNI 配置前先加载了 flannel。
+**解决**：更新 certSANs 包含所有节点管理/服务 IP 和两个 ELB IP，在三台 master 重新生成证书并重启 API server。
 
-**解决**：删除 `/etc/cni/net.d/*` 内容，重启 kubelet。
+**最终 certSANs**：`10.254.1.187, 10.254.1.232, 10.254.1.25, 10.254.9.49, 10.254.9.229, 10.254.9.85, 10.254.9.147, 115.175.0.82`
 
----
+##### 3. 证书重新生成时丢失老 SAN 致 API server CrashLoop
 
-##### 3. 证书不含 ELB IP 致 TLS 验证失败
+**现象**：为新 ELB 重新生成证书后 API server 全部 CrashLoopBackOff。
 
-**现象**：lab 节点 `kubeadm join 10.254.9.147:6443` 报 `x509: certificate is valid for 10.96.0.1, 10.254.1.187, not 10.254.9.147`。
+**根因**：`kubeadm init phase certs apiserver` 不自动合并已有 SAN，完全按 ConfigMap 中列表重新生成。某次只写入新 IP 而遗漏了 `10.254.1.187`。
 
-**根因**：`kubeadm init` 时证书仅包含 control-plane-endpoint IP。
+**解决**：每次修改 certSANs 前确保所有 IP 都在列表中。生成后分发到所有 master 并重启 API server。
 
-**解决**：更新 certSANs 列表，包含所有节点的管理和服务 IP 以及两个 ELB IP，重新生成证书并分发到全部 master。
+##### 4. cluster-info 和 kube-proxy ConfigMap 指向老地址
 
----
+**现象**：lab 节点 join 时连接 `10.254.1.187:6443` 不通，kube-proxy 持续超时。
 
-##### 4. 证书重新生成时丢失老 SAN 致 API server CrashLoop
+**根因**：ConfigMap 中 hardcoded 初始 server 地址，ELB 添加后未同步。
 
-**现象**：为新 ELB 重新生成证书后 API server 全部 CrashLoopBackOff，kubectl 报证书不包含 `10.254.1.187`。
+**解决**：手工更新两个 ConfigMap 为 ELB `10.254.9.147:6443`。
 
-**根因**：`kubeadm init phase certs apiserver` 不自动合并已有 SAN，完全按 ConfigMap 中的列表重新生成。写入新增 IP 时遗漏了原有 IP。
+##### 5. 云下子网无法访问外网镜像仓库
 
-**解决**：每次修改 certSANs 必须保留所有已有 IP。最终 certSANs 列表：`10.254.1.187, 10.254.1.232, 10.254.1.25, 10.254.9.49, 10.254.9.229, 10.254.9.85, 10.254.9.147, 115.175.0.82`
+**现象**：lab 节点 `yum install kubeadm` 失败，`registry.k8s.io` 和 `quay.io` 镜像拉取超时。
 
----
-
-##### 5. cluster-info 和 kube-proxy ConfigMap 指向老地址
-
-**现象**：lab 节点 join 时尝试连接 `10.254.1.187:6443`（不通），lab 节点 kube-proxy 日志持续超时。
-
-**根因**：这两个 ConfigMap 中硬编码了 kubeadm init 时的 server 地址，ELB 添加后未同步。
-
-**解决**：手工更新两个 ConfigMap 中的 server 地址为 ELB `10.254.9.147:6443`。
+**解决**：从 master-01 下载 aarch64 RPM 包 scp 传输；所有节点 containerd 配置 阿里云（`registry.aliyuncs.com`）和 daocloud（`docker.m.daocloud.io`）镜像代理。
 
 ---
 
@@ -142,229 +158,172 @@
 
 ### 3.1 检查云下机器情况
 
-1. 确认操作系统为 openEuler 24.03 LTS-SP4，架构 aarch64
+1. 确认 openEuler 24.03 LTS-SP4, aarch64
 2. 确认 Ascend950DT 驱动和 CANN 9.1.0 已安装（`npu-smi info` 可见 8 张卡）
-3. 确认节点公网出流量可达（`curl www.baidu.com` 成功）
-4. 确认共享存储 `/mnt/share` 和 `/mnt/weight` NFS 挂载可用
+3. 确认共享存储 `/mnt/share` 和 `/mnt/weight` NFS 可用
 
 ### 3.2 云下系统准备
 
-1. 设置唯一 hostname（`lab-worker-01`、`lab-worker-02` 等）
-2. 关闭 swap（OpenEuler 默认开启）
+1. 设置唯一 hostname（避免 `localhost.localdomain` 冲突）
+2. 关闭 swap
 3. 创建 `/run/systemd/resolve/resolv.conf` 软链接（OpenEuler 无 systemd-resolved）
-4. 安装 containerd v1.6（OpenEuler 自带），配置 SystemdCgroup + 镜像代理（daocloud + aliyuncs）
-5. 从 master-01 下载 aarch64 版 kubeadm/kubelet/kubectl RPM 包，scp 传输后本地 rpm 安装
-6. `kubeadm join` 通过 ELB `10.254.9.147:6443` 加入集群
+4. 安装 containerd v1.6，配置镜像代理和 sandbox 镜像
+5. 从 master-01 scp 传输 kubeadm RPM 包并 rpm 安装
+6. `kubeadm join` 通过 ELB 加入集群
 
 ### 3.3 云下安装 Ascend 组件
 
-1. 安装 Ascend Docker Runtime（containerd 集成场景）
+1. 安装 Ascend Docker Runtime（升级到 v26.1.0.beta.2 匹配 Device Plugin）
 2. 部署 Device Plugin DaemonSet（volcanoType=true, presetVirtualDevice=true）
 3. 部署 NodeD DaemonSet
-4. 配置 Volcano 调度器
 
-### 3.4 验证
+### 3.4 接入 K8s
 
-1. `kubectl get nodes` 确认节点 Ready
-2. `kubectl describe node <name> | grep npu` 确认 NPU 资源可见
-3. Device Plugin + NodeD pod Running
+1. 验证节点 Ready + NPU 资源可见
+2. Device Plugin + NodeD pod Running
 
 ---
 
 #### 遇到的问题
 
-##### 1. OpenEuler 无 systemd-resolved
+##### 1. OpenEuler 无 systemd-resolved 致 Pod sandbox 创建失败
 
-**现象**：Pod sandbox 创建失败，kubelet 日志 `open /run/systemd/resolve/resolv.conf: no such file or directory`。
-
-**根因**：OpenEuler 24.03 不使用 systemd-resolved，kubelet 默认配置引用该路径。
+**现象**：kubelet 日志 `open /run/systemd/resolve/resolv.conf: no such file or directory`。
 
 **解决**：`mkdir -p /run/systemd/resolve && ln -sf /etc/resolv.conf /run/systemd/resolve/resolv.conf`
 
----
-
 ##### 2. containerd v1.6 与 v2.x 配置格式不同
 
-**现象**：从 master 复制 containerd 配置后启动失败或 mirror 不生效。
+**现象**：从 master 复制配置后 mirror 不生效或 containerd 启动失败。
 
-**根因**：OpenEuler 自带 v1.6，使用旧版 config 格式。Registry mirror 在 `[plugins."io.containerd.grpc.v1.cri".registry.mirrors]` 段，不同于 v2.x 的 `certs.d` 目录。`sandbox_image` 用双引号格式。
+**根因**：OpenEuler 自带 v1.6，使用旧版 TOML 格式。Registry mirror 在 `[plugins."io.containerd.grpc.v1.cri".registry.mirrors]` 段，sandbox_image 用双引号。
 
-**解决**：使用 `containerd config default` 生成 v1.6 默认配置，再手动添加 mirror 和 sandbox 修改。
+**解决**：使用 v1.6 默认配置生成后手动修改。
 
----
+##### 3. 两节点 hostname 相同致相互覆盖
 
-##### 3. Lab 节点外网下载软件包不稳定
+**现象**：加入两台后只显示一个 `localhost.localdomain`。
 
-**现象**：`yum install kubeadm` 失败，`Could not resolve host: mirrors.aliyun.com`。
+**解决**：加入前设唯一 hostname。
 
-**根因**：lab 节点 DNS 解析正常，但到某些 CDN 的 TCP 连接不通。
+##### 4. Ascend Docker Runtime 版本与 Device Plugin 不匹配
 
-**解决**：从有外网的 master-01 下载 aarch64 RPM 包，通过 scp 传输。用 `rpm -ivh --nodeps` 安装（`--nodeps` 跳过 kubernetes-cni 依赖，Cilium 自带 CNI 插件）。kubelet 配置 node-ip 指向云下管理 IP。
+**现象**：NPU 容器 `dcmi init failed, error code: -8255`。
 
----
+**根因**：v7.0.RC1 仅 DCMIv1，Device Plugin v26.x 用 DCMIv2。需 v26.x Runtime。
 
-##### 4. 两节点 hostname 相同致相互覆盖
+**解决**：升级到 v26.1.0.beta.2（**坑**：installer 文件名必须含 `aarch64`）。
 
-**现象**：加入两台 lab 节点后 `kubectl get nodes` 只显示一个 `localhost.localdomain`。
+##### 5. 资源名不一致——ConfigMap `ascend-a5` vs 节点 `npu`
 
-**根因**：两台初始 hostname 相同，K8s 以 hostname 为节点唯一标识。
+**现象**：Volcano `Unschedulable: huawei.com/ascend-a5 not found`。
 
-**解决**：加入集群前设置唯一 hostname。
+**解决**：全部 ConfigMap 改为 `huawei.com/npu`。
 
----
+##### 6. presetVirtualDevice=false 致 Device Plugin CrashLoop
 
-##### 5. Ascend Docker Runtime 与 Device Plugin 版本不匹配
+**现象**：`only 310p, 910a2 and 910a3 support presetVirtualDevice false`
 
-**现象**：NPU 容器启动失败 `dcmi init failed, error code: -8255`。
+**根因**：Ascend950DT 仅支持静态虚拟化。
 
-**根因**：Runtime v7.0.RC1 仅支持 DCMIv1 API，Device Plugin v26.x 使用 DCMIv2。Ascend950DT 需要 v26.x Runtime。
+**解决**：保持 `presetVirtualDevice=true`，vnpu.cfg `dev0:0-7`。
 
-**解决**：升级 Runtime 到 v26.1.0.beta.2。注意：installer 文件名必须包含 `aarch64`。
+##### 7. liburma.so.0 缺失致 workflow PostStartHook 超时
 
----
+**现象**：容器 Started 后 300s FailedPostStartHook。
 
-##### 6. 资源名不一致——ConfigMap 写 `huawei.com/ascend-a5` 但节点注册 `huawei.com/npu`
+**根因**：npu-smi 依赖 `/usr/lib64/liburma.so.0`，pod 未挂载。
 
-**现象**：Volcano 调度报 `Unschedulable: huawei.com/ascend-a5 not found`。
-
-**根因**：ConfigMap 中资源名与 Device Plugin 实际注册的不一致。
-
-**解决**：所有 ConfigMap 和 values 中的 NPU 资源名统一改为 `huawei.com/npu`。
+**解决**：ConfigMap 加 hostPath `/usr/lib64` → `/usr/lib64`。
 
 ---
 
-##### 7. presetVirtualDevice=false 导致 Device Plugin CrashLoop
+## 四、云上云下网络联通与 CNI 修复
 
-**现象**：Device Plugin CrashLoop，日志 `only 310p, 910a2 and 910a3 support presetVirtualDevice false`。
+此阶段是整个部署的核心难点，涉及路由、SNAT、CNI 模式四个层面的问题。
 
-**根因**：Ascend950DT 只支持静态虚拟化。
+### 4.1 问题一：集群业务 IP 设置异常
 
-**解决**：保持 `presetVirtualDevice=true`，配置 vnpu.cfg `dev0:0-7` 实现 1×8 卡虚拟设备。
+**问题**：master 业务网段从 `10.254.1.0/24` 切换到 `10.254.9.0/24` 不彻底。master-02/03 上遗留 4 条指向**旧管理 IP**（`10.254.1.x`）的 pod CIDR 静态路由，走管理网卡 eth1，**绕过绑在业务网卡 eth0 的 Cilium 数据面**；且部分 pod CIDR 路由缺失。
 
----
+**现象**：跨节点 pod 互不通；`cilium-health` 仅 1/7 reachable；master 间 Node 通但 Endpoints 0/1。
 
-##### 8. liburma.so.0 缺失导致 workflow pod PostStartHook 超时
+**修复**：
+- 删除 master-02/03 上 4 条遗留路由（`10.0.x.0/24 via 10.254.1.x dev eth1`）
+- Cilium 切为 tunnel 模式（见 4.4），跨节点 pod CIDR 路由改由 Cilium 自动维护，不再依赖外部静态路由
 
-**现象**：容器 Started 后 300s FailedPostStartHook，日志 `liburma.so.0: cannot open shared object file`。
+**效果**：所有远端 pod CIDR 经 `cilium_host`（tunnel 设备）路由，跨节点 pod 全通，`cilium-health` 7/7。
 
-**根因**：Ascend950DT 的 `npu-smi` 依赖 `/usr/lib64` 下的 `liburma.so.0`，workflow pod 未挂载该路径。
+### 4.2 问题二：CoreDNS 服务异常
 
-**解决**：ConfigMap 添加 hostPath volume `/usr/lib64` → 容器 `/usr/lib64`。
+**问题**：问题是 4.1 的衍生。CoreDNS ClusterIP `10.96.0.10` 被 kube-proxy DNAT 到 master-03 的 pod（`10.0.3.x`），DNS 包走 master-02 上 `10.0.3.0/24 via 10.254.1.25 dev eth1` 这条指向旧管理 IP 的死路由，**绕过 Cilium 被丢**。
 
----
+**现象**：pod 内 `dig @10.96.0.10 baidu.com` 超时；`dig @10.0.3.202 baidu.com` 超时；所有业务域名无法解析。
 
-##### 9. Volcano NPU 插件无默认 handler
+**修复**：随 4.1 一并修复——删死路由 + 切 tunnel + 重启 cilium，DNS 流量回归 Cilium 数据面。
 
-**现象**：NPU job 调度失败 `validNPUJob failed: no policy handler registered`。
+**效果**：`dig @10.96.0.10 baidu.com` 正常；pod 内业务域名解析恢复。
 
-**根因**：Volcano NPU 插件需要 pod annotation 指定调度策略，950DT 无预配置 handler。
+**补充细节（初始搭建阶段）**：
 
-**解决**：PodTemplate 添加 annotation `huawei.com/schedule_policy: chip1-node8`。
-
----
-
-## 四、云上云下实现联通（Pod 网络与 DNS）
-
-此为整个部署最核心也最耗时的阶段，涉及 3 条链路 7 个子问题。
-
-### 4.1 DNS 链路分析
-
+在路由修复之前，DNS 链路存在 3 个断裂点：
 ```
-Pod (10.0.x.x)
-  → CoreDNS ClusterIP (10.96.0.10)     [链路1]
-  → CoreDNS pod → forward → 上游DNS     [链路2]
-  → 上游DNS回复 → 回不到 Pod             [链路3]
+Pod → CoreDNS ClusterIP (10.96.0.10)    [断裂点1]
+     → CoreDNS forward → 上游DNS          [断裂点2]
+     → 上游DNS回复 → 回不到Pod             [断裂点3]
 ```
 
-### 4.2 链路修复
+- 断裂点 1 因 `kube-proxy-replacement: true` 时 Cilium BPF Service 路由失效。临时关闭 kube-proxy replacement 回退 iptables。
+- 断裂点 2 因 CoreDNS 转发到不可达的上游 DNS（初始 `114.114.114.114` 从 lab 不通，改为数据面 DNS `178.27.1.100`）。
+- 断裂点 3 因 Pod 出站流量未 SNAT，Pod IP（10.0.x.x）在数据面网络无回程路由。后续切 tunnel + 加 SNAT（见 4.3）统一修复。
 
-1. **链路 1 — Cilium kube-proxy replacement 不工作**：关闭 kube-proxy replacement，回退到 iptables 模式。验证：Pod 内能 `curl https://10.96.0.1:443` 返回 `ok`
+### 4.3 问题三：路由与 iptables 规则遗漏
 
-2. **链路 2 — CoreDNS 转发到不可达上游**：迭代 3 次修正 forward 目标，最终恢复 `forward . /etc/resolv.conf`。lab 节点 DNS 顺序调整为 `114.114.114.114` 在前、`178.27.1.100` 在后
+**问题**：两个层面叠加：
+- (a) master-02/03 遗留 4 条旧 pod CIDR 静态路由（见 4.1）
+- (b) **pod → master 节点 IP / kubernetes service `10.96.0.1:443` 不通**：Cilium 对 master 节点 IP 既不 SNAT 也不走隧道，pod 源 IP（`10.0.x.x`）裸送 underlay。站点间 IPsec 网关只认节点网段（`10.254.9.0/24 ↔ 192.168.8.0/21`），**不认 pod 源 IP** → 丢包。
 
-3. **链路 3 — 回包路由不通（Cilium masquerade）**：启用 BPF masquerade + NodePort。根因是 iptables masquerade 规则的 `oifname != "cilium_*"` 条件跳过了 `cilium_host` 出口的流量，BPF 层面不受此限制
+**现象**：pod 内 `curl https://10.96.0.1:443/version` 超时；`ping 10.254.9.229` 100% 丢包；出口抓包源 IP 仍是 pod IP（未 SNAT）。仅 pod→master 节点 IP 不通，pod→pod、pod→外网均通。
 
-### 4.3 临时绕过方案
+**修复**：
+- (a) 删 4 条旧路由（见 4.1）
+- (b) 在 4 个 worker + admin123 上加 iptables SNAT 规则：
+  ```
+  iptables -t nat -A POSTROUTING -s 10.0.0.0/8 -d 10.254.9.0/24 -j MASQUERADE
+  ```
+  将 pod 源 IP SNAT 成节点 IP，IPsec 网关认可。
+- 持久化：worker 用 `firewall-cmd --permanent --direct`（firewalld active），admin123 用 networkd-dispatcher 钩子（Ubuntu 无 firewalld），均验证 reload/重启存活
 
-在 DNS 完全修复前，给 ARC controller、listener、runner 等关键 Pod 加 `dnsPolicy: None` + 直接指定 `114.114.114.114` 作为 DNS。
+**效果**：`curl https://10.96.0.1:443/version` 返回 200；ping master IP 全通；出口源 IP 已 SNAT 成节点 IP；规则 reload/重启不丢。
 
-### 4.4 时钟同步
+### 4.4 问题四：CNI 组件版本与模式差异
 
-lab 节点时钟比实际快 8 小时，导致 GitHub JIT token 的 `nbf` 校验失败（token 看起来在未来生效），runner 创建 session 失败 → 退出 → listener 重新创建 → 无限循环。
+**问题**：Cilium `routing-mode` 原选 **native**（直接路由），但本集群是 VPN 跨站拓扑 + worker 多网卡（enp34s0f1、data0 等）+ Ascend NPU 设备干扰。native 模式需自动探测 direct-routing device（underlay 出口网卡），worker-01/03 探测失败；且 native + `auto-direct-node-routes: false` 依赖外部静态路由，对 VPN 拓扑不友好。
 
-从 master-01 同步正确时间后修复。遗留问题：需配置 NTP 永久解决。
+**现象**：worker-01/03 cilium pod CrashLoopBackOff，fatal 日志 `unable to determine direct routing device`；这两台 cilium agent 起不来，其上 pod 网络异常。
 
----
+**修复**：ConfigMap `routing-mode: native → tunnel`（VXLAN 封装），`kubectl rollout restart ds/cilium`。tunnel 模式不依赖 direct-routing device，跨节点流量经 VXLAN 封装（外层节点 IP），pod CIDR 路由由 Cilium 自维护。
 
-#### 遇到的问题
+**效果**：cilium 7/7 Running，无 CrashLoop；worker-01/03 自愈；VXLAN 隧道（UDP/8472）正常；MTU 1450。
 
-##### 1. Cilium kube-proxy replacement BPF 路由不正常
+**补充细节（初始搭建阶段尝试过的方案）**：
 
-**现象**：Pod 内 `curl https://10.96.0.1:443` 超时。CoreDNS kubernetes 插件 `Still waiting on: kubernetes`，无法初始化。
+初始阶段在 native 模式下尝试过多种修复均未成功：
+- 开 `enable-bpf-masquerade: true` + `enable-node-port: true`（BPF masquerade 依赖）：短暂生效但随 VPN 拓扑复杂化失效
+- 调整 `devices` 列表加入 lab 节点网卡名（`enp34s0f1`）：未解决根本问题
+- 改 `ipv4-native-routing-cidr` 从 `10.244.0.0/16` 到 `10.0.0.0/8`：必要但不充分
 
-**根因**：`kube-proxy-replacement: true` 时 Cilium 用 BPF 处理 Service IP 路由，但实际未能正确工作。
+最终 **切换为 tunnel 模式** 一劳永逸解决了 native routing 在 VPN 环境的所有兼容性问题。
 
-**解决**：关闭 kube-proxy replacement (`false`)，回退到 kube-proxy iptables 处理 Service IP。
+### 4.5 修复后集群整体状态
 
----
-
-##### 2. CoreDNS 转发上游 DNS 不通
-
-**现象**：Pod 内 DNS 查询到达 CoreDNS 后 SERVFAIL。
-
-**根因**：3 次迭代——初始 `114.114.114.114` 从 lab 不可达；改为 `178.27.1.100` 可达但回包路由不通；最终恢复默认 `/etc/resolv.conf` 等链路 3 修好后生效。
-
-**解决**：最终方案为 CoreDNS 用 `/etc/resolv.conf`，lab 节点 DNS 优先 `114.114.114.114`。
-
----
-
-##### 3. Cilium iptables masquerade 跳过 `cilium_host` 出口流量
-
-**现象**：host 上 `nslookup api.github.com <coredns-pod-ip>` 成功，Pod 内同等查询超时。
-
-**根因**：iptables masquerade 规则 `oifname != "cilium_*"` 导致通过 `cilium_host` 出口的 pod 流量未被 SNAT。Pod 源 IP (10.0.x.x) 在数据面网络 (178.27.0.0/18) 无回程路由。BPF masquerade 不受此接口过滤限制。
-
-**解决**：开 `enable-bpf-masquerade: true` + `enable-node-port: true`（后者是前者依赖，缺少会导致 CrashLoop）。
-
----
-
-##### 4. Cilium agent CrashLoop——BPF masquerade 依赖 NodePort
-
-**现象**：单独启用 BPF masquerade 后 Cilium agent CrashLoop，日志 `BPF masquerade requires NodePort`。
-
-**根因**：BPF masquerade 功能依赖 NodePort BPF 基础设施。
-
-**解决**：`enable-bpf-masquerade` 和 `enable-node-port` 必须同时设为 `true`。
-
----
-
-##### 5. CoreDNS pod 长时间 0/1 Ready
-
-**现象**：CoreDNS pod `0/1 Running`，readiness probe 503。
-
-**根因**：CoreDNS kubernetes 插件启动需连接 API server。Cilium 未就绪时 Service IP 路由不通，插件进入等待循环。
-
-**解决**：等 Cilium agent 全部 Ready 后，重启 CoreDNS pod 即可。
-
----
-
-##### 6. Lab 节点时钟偏差 8 小时致 runner 无限循环
-
-**现象**：Runner pod 日志 `token not valid until 21:43:24, server time is 13:43:09`，runner 不断创建-失败-退出-重建。
-
-**根因**：lab 节点时钟比实际快 8 小时。GitHub JIT token 的生效时间 (`nbf`) 基于实际 UTC，但 runner 用容器时间校验时认为 token 还未生效。
-
-**解决**：`date -s` 同步到 master 时间。遗留需配置 NTP 永久修复。
-
----
-
-##### 7. 反复重装 Helm 导致 scale set ID 变化、job 孤儿
-
-**现象**：多次 `helm uninstall/install` 后 GitHub job 永远 QUEUED。
-
-**根因**：每次重装向 GitHub 注册新 scale set ID，旧 job 绑定在旧 ID 上，GitHub 不会自动迁移。
-
-**解决**：确认配置后只安装一次，不再卸载。生产环境依赖 ArgoCD GitOps 管理。
+- `cilium-health`：7/7 reachable，所有节点 Node 1/1 Endpoints 1/1
+- cilium pod：7/7 Running，无 CrashLoop
+- pod 内 DNS：正常解析
+- pod → kubernetes api service（`10.96.0.1:443`）：通（含新增节点 admin123）
+- 跨节点 pod 互访：通
+- 4 worker firewalld 端口对齐：`10250/tcp 8472/udp 4240/tcp 30000-32767/tcp`
+- SNAT 规则持久化：worker（firewalld permanent direct）+ admin123（networkd-dispatcher 钩子），均验证 reload/重启存活
 
 ---
 
@@ -372,55 +331,56 @@ lab 节点时钟比实际快 8 小时，导致 GitHub JIT token 的 `nbf` 校验
 
 ### 5.1 GitOps 接入
 
-1. 在 ci-deployment 仓库新建 `projects/vllm-project/vllm-ascend/config-shanghai/`（namespace、SA、RBAC、Secret、ConfigMaps）
-2. 新建 `linux-aarch64-950dt-{2,4,8}-shanghai/`（runner scale set Helm values，从 A3 直接复制仅改标签）
-3. 新建 `argocd/clusters/shanghai-001/vllm-ascend.yaml`（ArgoCD Application）
-4. 提 PR 合入
+1. ci-deployment 仓库新建 `projects/vllm-project/vllm-ascend/config-shanghai/` 和 `linux-aarch64-950dt-{2,4,8}-shanghai/`
+2. 新建 `argocd/clusters/shanghai-001/vllm-ascend.yaml`
+3. values.yaml 从 A3-8 直接复制，仅改 3 处标签（避免手工编辑格式偏差）
+4. 提 PR 合入 + ArgoCD 注册集群
 
-### 5.2 ArgoCD 注册
+### 5.2 Service 迁移
 
-1. 使用 kubeconfig（指向管理面 ELB `115.175.0.82:6443`）注册集群
-2. 白名单放行 ArgoCD IP
+1. 新增 admin123（192.168.13.107）作为服务节点
+2. 迁移 resource-api、ARC controller、listeners、secrets-manager、imagepullsecret-patcher
+3. 部署 nginx-pypi-cache
+4. PVC 改 hostPath（无 storage provisioner）
 
-### 5.3 Service 迁移
+### 5.3 Runner Scale Set
 
-1. 新增 admin123（192.168.13.107）作为专用服务节点（x86_64, 56C/251G）
-2. 迁移 resource-api、ARC controller、listeners、secrets-manager、imagepullsecret-patcher 从 master 到 admin123
-3. 部署 nginx-pypi-cache（PyPI/APT/Rust/YUM 缓存代理）
-4. 配置要点：DNS 优先 `114.114.114.114`、containerd mirror daocloud+aliyuncs、PVC 改 hostPath
+1. 安装 ARC Controller 0.14.2
+2. 部署 listener + runner scale set（`linux-aarch64-950dt-{2,4,8}`）
+3. 验证 runner 接 GitHub job 成功完成
 
-### 5.4 Weight NFS 路径调整
+**注意**：每次 Helm 重装会向 GitHub 注册新 scale set ID，旧 job 会孤儿。确认配置后只装一次不再卸载。
 
-后加入的 lab-03/04 无 `/mnt/weight` NFS 挂载。ConfigMap 中 weight 路径改为 `/mnt/share/vllm-ascend/weight`（所有节点共享），`type: DirectoryOrCreate`。
-
-### 5.5 Values.yaml 与 A3 对齐
-
-PR 中 values.yaml 直接从 A3-8 复制，仅改 3 处标签避免手工编辑引入格式偏差：
-```
-a3-8 → 950dt-n
-ascend-1980 → ascend-950dt
-gy-005 → shanghai-001
-```
-
-### 5.6 遗留事项
+### 5.4 遗留事项
 
 | # | 事项 | 优先级 |
 |---|------|:--:|
-| 1 | ArgoCD 注册集群 + PR 合入 | 高 |
+| 1 | ArgoCD 注册集群 + PR 合入，纳入 GitOps | 高 |
 | 2 | lab 节点 NTP 永久配置 | 中 |
-| 3 | CoreDNS 回包路由永久修复（去掉 dnsPolicy workaround） | 中 |
-| 4 | Volcano + Device Plugin + NodeD 完整部署 | 中 |
+| 3 | Volcano + Device Plugin + NodeD 完整部署 | 中 |
 
 ---
 
-## 附录：排查模式速查
+## 附录 A：排查模式速查
 
 | 排查模式 | 适用场景 |
 |----------|----------|
 | DNS 链路分段验证（Pod→CoreDNS→上游→回包） | 任何 Pod 内网络不通 |
 | 证书 SAN 列表必须完整，修改后三台 master 都需重新生成+重启 | 添加新入口 IP |
-| 时钟偏差 → JIT token nbf 校验失败 | Runner 无限循环 |
+| 时钟偏差 → JIT token nbf 校验失败 | Runner 无限循环创建 |
 | Helm 重装 → scale set ID 变化 | GitHub job 永远 queued |
-| Docker Registry /v2/ 返回 401 = 正常认证流程 | 误判为镜像仓库故障 |
-| OpenEuler 与 Ubuntu 差异（systemd-resolved、containerd 版本、包管理器） | 云下节点部署 |
-| values.yaml 从已有配置直接复制，不手工编辑 | 避免格式和 lint 错误 |
+| Docker Registry `/v2/` 返回 401 = 正常认证流程 | 误判为镜像仓库故障 |
+| OpenEuler 与 Ubuntu 差异 | 云下节点部署 |
+| VPN 拓扑优先 tunnel 模式而非 native | CNI 选型 |
+| pod→master 不通先查出口是否有 SNAT | 混合网络排查 |
+
+## 附录 B：关键架构决策
+
+| 决策 | 原因 |
+|------|------|
+| Cilium routing-mode 从 native 切 tunnel | VPN 跨站 + 多网卡 + native device 探测失败 |
+| 在 worker 上加 iptables SNAT 而非依赖 Cilium masquerade | IPsec 网关只认节点网段，pod 源 IP 被丢 |
+| kube-proxy-replacement=false | BPF Service 路由在 Cilium 异常时不可靠 |
+| 证书包含所有节点 IP + 两个 ELB IP | 避免多入口 TLS 失败 |
+| values.yaml 100% 从 A3 复制 | 最小化差异，杜绝格式错误 |
+| Helm 只装一次 | 避免 scale set ID 变化孤儿 job |
