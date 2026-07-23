@@ -124,6 +124,7 @@ K8s：v1.32.13
 
 1. 部署 resource-api（FastAPI）和 vue-frontend（Vue.js + Nginx），arc-system namespace （基础设施开发）
 2. 安装 ARC Controller（actions-runner-controller 0.14.2） （基础设施开发）
+3. 部署 secret 和 imagepullsecret-patch 服务 （基础设施开发）
 
 ### 2.3 证书与 ELB 配置
 
@@ -375,6 +376,8 @@ Pod → CoreDNS ClusterIP (10.96.0.10)    [断裂点1]
 ---
 
 ## 五、后续维护
+### 5.1 注册github，argocd，在[ascend](https://github.com/opensourceways/ascend-ci-deployment) 仓库部署 （基础设施开发）
+
 ### 5.1 openeuler和容器ubuntu的C运行时库不兼容
 
 **现象**：openeuler镜像可通过npusmi-info查看npu信息，但ubuntu镜像不行。
