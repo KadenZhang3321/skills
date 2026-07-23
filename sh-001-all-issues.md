@@ -37,39 +37,62 @@ K8s：v1.32.13
 
 ## 总览
 
-| # | 问题 | 根因 | 修复 | 状态 |
-|---|------|------|------|:--:|
-| 1 | 跨节点 Pod 路由不通 | 业务面切换不彻底，遗留指向旧管理 IP 的死路由 | 删旧路由 + 切 Cilium tunnel | Done |
-| 2 | CoreDNS 无法解析 | DNS 流量走遗留死路由被丢 | 修复路由后自愈 | Done |
-| 3 | Pod→master 节点 IP 不通 | pod 源 IP 裸送 underlay，IPsec 网关不认，缺 SNAT | 加 iptables SNAT 并持久化 | Done |
-| 4 | Cilium worker CrashLoop | native 模式在 VPN+多网卡环境探测 device 失败 | 切 tunnel 模式 | Done |
-| 5 | 证书不含 ELB IP | kubeadm init 时仅含 control-plane-endpoint | 补全 certSANs + 重新生成证书 | Done |
-| 6 | Lab 节点时钟偏差 8h | openEuler 系统时间未同步 | date 同步 + 待配 NTP | Done |
-| 7 | Runner JIT token 校验失败 | 时钟偏差导致 token nbf 在未来 | 修复时钟后自愈 | Done |
-| 8 | Lab 节点 containerd/系统差异 | OpenEuler vs Ubuntu 的 systemd-resolved、containerd v1.6 | 适配配置 | Done |
-| 9 | DevOps 流程与配置管理 | 反复重装致 scale set ID 变化、values.yaml 格式 | GitOps + 对齐 A3 模板 | Done |
+| # | 负责内容 | 责任对象 |
+|---|------|------|
+| 1 | 云下实验室物理机器 | 对应业务部门 |
+| 2 | 云下实验室机器系统OS安装 | 对应业务部门 | 
+| 3 | 云下实验室机器mindcluster组件安装 | 最好找mindcluster部门同事安装 | 
+| 4 | 云上云下防火墙申请 | 基础设施开发 | 
+| 5 | 云上云下VPN配置 | 基础设施运维与装备部同事 |
+| 6 | 云上k8s搭建 | 基础设施 |
+| 7 | 云上DNS网络配置 | 基础设施运维 |
+| 8 | 云下节点云上K8s | 基础设施运维 |
+
+--
+## 软件/安装组件/插件/服务需求
+| # | 用途 | 云上 | 云下 |
+|---|------|------|------|
+|Kubernetes v1.32.13 | 容器编排平台，集群基础设施  | ✓ | ✓ |
+| Cilium v1.17.2（tunnel/VXLAN）   | CNI 网络插件，跨节点 Pod 通信 | ✓ | ✓ |
+| CoreDNS                              | 集群内部 DNS，Service 发现        |  ✓   |  —   |
+| etcd（3 成员 HA）                     |K8s 数据存储，配置和状态同步    |  ✓   |  —   |
+| ARC Controller 0.14.201               |GitHub Actions Runner 生命周期管理    |  ✓   |  —   |
+| resource-api + vue-frontend             |集群资源管理后台 + 前端面板  |  ✓   |  —   |
+| Volcano（controller/scheduler/admission）| NPU 感知的批量调度器，分配 NPU 资源  |  ✓   |  —   |
+| npu-scheduler（自定义 scheduler）        | Ascend 自定义调度器，过滤/排序 NPU 节点  |  ✓   |  —   |
+| secrets-manager                           |从 Vault 自动同步 GitHub Token 等密钥|  ✓   |  —   |
+| imagepullsecret-patcher                  |自动为 ServiceAccount 注入镜像仓库认证 |  ✓   |  —   |
+| nginx-pypi-cache                          |PyPI/APT/Rust/YUM 缓存代理，加速依赖下载 |  ✓   |  —   |
+| containerd                               |容器运行时    |  ✓   |  ✓   |
+| Ascend Docker Runtime v26.1.0.beta.2    | NPU 设备容器化支持，自动挂载驱动和依赖    |  —   |  ✓   |
+| Ascend Device Plugin                    |注册 huawei.com/npu 资源，设备发现、健康检查、分配  |  —   |  ✓   |
+| CANN 9.1.0 + NPU 驱动                  |昇腾 AI 计算框架和芯片驱动   |  —   |  ✓   |
+| Ascend950DT（8×96GB HBM）               |昇腾训练芯片，单卡 96GB HBM，集群计算资源  |  —   |  ✓   |
+|  NFS 共享存储                 |pip 缓存 + 模型权重共享存储  |  —   |  ✓   |
+
+
 
 ---
 
 ## 一、前期网络准备（具体操作看https://wiki.huawei.com/domains/987/wiki/16328/WIKI2026071511873767）
 
-### 1.1 准备云上、云下资源 
+### 1.1 准备云上、云下资源 （涉及人员：基础设施 & 业务部门 & 装备部）
 
-1. 获取云下计算节点 IP、地址、网关、公网 IP
-2. 准备云上各 master IP、VPN 网关、管理面 IP、业务面 IP 和 VPC（选择地理位置接近的 Region）
+1. 获取云下计算节点 IP、地址、网关、公网 IP （基础设施开发）
+2. 准备云上各 master IP、VPN 网关、管理面 IP、业务面 IP 和 VPC（选择地理位置接近的 Region） （基础设施运维）
 
 ### 1.2 开通 GRE 防火墙
 
-1. 将云上 IP 和云下公网 IP 分别填入目的端和源端，打通双向
-2. 推动审批流程
+1. 将云上 IP 和云下公网 IP 分别填入目的端和源端，打通双向，在防火墙端口位置需要特别注意最后两个特俗端口，不是输入进去而是选择的特俗端口 （基础设施开发）
+2. 推动审批流程 （基础设施开发）
 
 ### 1.3 配置 VPN
 
-1. 云上和云下都配置 IPsec VPN，确保所有参数一一匹配
+1. 云上和云下都配置 IPsec VPN，确保所有参数一一匹配 （基础设施运维 & 装备部 & 实验室机器运维）
 
 ### 1.4 安全组修改
 
-1. 修改 ECS 安全组，将云上和云下小网段加入入方向放通规则
+1. 修改 ECS 安全组，将云上和云下小网段加入入方向放通规则 （基础设施运维）
 
 ### 1.5 验证并做安全加固
 
@@ -86,27 +109,27 @@ K8s：v1.32.13
 **解决**：切换为 `10.254.9.0/24` 网段后回程路由唯一，问题解决。
 
 ---
-
-## 二、云上搭建 K8s
+ 
+## 二、云上搭建 K8s （涉及人员：基础设施）
 
 ### 2.1 K8s 集群初始化
 
-1. 三台 master 节点系统准备（hostname、swap off、kernel modules、sysctl）
-2. 安装 containerd v2.2.6，配置 SystemdCgroup + 阿里云镜像加速
-3. `kubeadm init`：API server 绑定管理面 IP `10.254.1.187`
-4. 安装 Cilium CNI（最终采用 tunnel/VXLAN 模式，见第四节）
-5. 加入 master-02/03 作为 control-plane 节点
+1. 三台 master 节点系统准备（hostname、swap off、kernel modules、sysctl） （基础设施开发）
+2. 安装 containerd v2.2.6，配置 SystemdCgroup + 阿里云镜像加速 （基础设施开发）
+3. `kubeadm init`：API server 绑定管理面 IP `10.254.1.187` （基础设施开发）
+4. 安装 Cilium CNI（最终采用 tunnel/VXLAN 模式，见第四节） （基础设施开发）
+5. 加入 master-02/03 作为 control-plane 节点 （基础设施开发）
 
 ### 2.2 组件服务安装
 
-1. 部署 resource-api（FastAPI）和 vue-frontend（Vue.js + Nginx），arc-system namespace
-2. 安装 ARC Controller（actions-runner-controller 0.14.2）
+1. 部署 resource-api（FastAPI）和 vue-frontend（Vue.js + Nginx），arc-system namespace （基础设施开发）
+2. 安装 ARC Controller（actions-runner-controller 0.14.2） （基础设施开发）
 
 ### 2.3 证书与 ELB 配置
 
-1. 将所有需要访问 API server 的 IP（管理面、服务面、ELB）加入 `apiServer.certSANs`
-2. 三台 master 重新生成 API server 证书并重启
-3. 更新 cluster-info 和 kube-proxy ConfigMap 中的 server 地址为 ELB
+1. 将所有需要访问 API server 的 IP（管理面、服务面、ELB）加入 `apiServer.certSANs` （基础设施开发）
+2. 三台 master 重新生成 API server 证书并重启 （基础设施开发）
+3. 更新 cluster-info 和 kube-proxy ConfigMap 中的 server 地址为 ELB （基础设施开发）
 
 ---
 
@@ -156,13 +179,13 @@ K8s：v1.32.13
 
 ## 三、云下机器系统准备与软件安装
 
-### 3.1 检查云下机器情况
+### 3.1 检查云下机器情况 （基础设施开发）
 
-1. 确认 openEuler 24.03 LTS-SP4, aarch64
+1. 确认 openEuler 24.03 LTS-SP4, aarch64 
 2. 确认 Ascend950DT 驱动和 CANN 9.1.0 已安装（`npu-smi info` 可见 8 张卡）
 3. 确认共享存储 `/mnt/share` 和 `/mnt/weight` NFS 可用
 
-### 3.2 云下系统准备
+### 3.2 云下系统准备 （基础设施开发）
 
 1. 设置唯一 hostname（避免 `localhost.localdomain` 冲突）
 2. 关闭 swap
@@ -171,13 +194,13 @@ K8s：v1.32.13
 5. 从 master-01 scp 传输 kubeadm RPM 包并 rpm 安装
 6. `kubeadm join` 通过 ELB 加入集群
 
-### 3.3 云下安装 Ascend 组件
+### 3.3 云下安装 Ascend 组件 （基础设施开发 & mindcluster 同事）
 
 1. 安装 Ascend Docker Runtime（升级到 v26.1.0.beta.2 匹配 Device Plugin）
 2. 部署 Device Plugin DaemonSet（volcanoType=true, presetVirtualDevice=true）
 3. 安装 volcano 昇腾插件
 
-### 3.4 接入 K8s
+### 3.4 接入 K8s（基础设施开发）
 
 1. 验证节点 Ready + NPU 资源可见
 2. Device Plugin + NodeD pod Running
@@ -262,7 +285,7 @@ K8s：v1.32.13
 
 ---
 
-## 四、云上云下网络联通与 CNI 修复
+## 四、云上云下网络联通与 CNI 修复 （基础设施运维）
 
 此阶段是整个部署的核心难点，涉及路由、SNAT、CNI 模式四个层面的问题。
 
