@@ -276,7 +276,37 @@ K8s：v1.32.13
 
 **解决**：联系mindclust 同事排查，需要再configmap 加上annotation的key。
 
-##### 10. 云下机器无法连接外网
+##### 10. Device Plugin volcanoType=true 致 1/2/4 卡 Pod 全部 UnexpectedAdmissionError（仅 8 卡正常） 🔥
+
+**发现时间**：2026-07-30
+
+**现象**：
+- 1、2、4 卡 pod 稳定报 `UnexpectedAdmissionError: Allocate failed due to rpc error: code = Unknown desc = not get valid pod`
+- 8 卡 pod 完全正常
+- 无论 Volcano 还是默认调度器均受影响
+- 重启 device plugin daemonset、清空 vcjob-fault-npu-cm、修改 vnpu.cfg 均无效
+
+**根因**：
+Device plugin 启动参数 `-volcanoType=true` 表示期望 Volcano 安装了 Ascend NPU 亲和性插件（deviceshare + AscendMindClusterVNPUEnable），由插件选出具体哪几个 NPU 并写回 pod annotation，Allocate 时 device plugin 读这个 annotation 来完成设备分配。但当前 Volcano 只装了原生开源版，没有 Ascend for Volcano 插件 → pod 上缺少设备选择 annotation → device plugin 的 filter（`plugin.go:888`）找不到 pod → `no pod passed the filter` → 3 次 retry 后 `plugin.go:1327 not get valid pod`。
+
+8 卡不受影响的原因：全节点 8 卡无需"选哪几个"，直接全量分配，不经过 filter。
+
+**关键日志**（device plugin container stdout）：
+```
+[INFO]  server/plugin.go:1316   request: []string{"npu-2", "npu-3"}
+[WARN]  server/plugin.go:888    no pod passed the filter, request device: [npu-2 npu-3], retry: 0
+[WARN]  server/plugin.go:888    no pod passed the filter, request device: [npu-2 npu-3], retry: 1
+[WARN]  server/plugin.go:888    no pod passed the filter, request device: [npu-2 npu-3], retry: 2
+[ERROR] server/plugin.go:1327   not get valid pod
+```
+
+**解决**：Device plugin daemonset args 改 `-volcanoType=true` → `-volcanoType=false`，`-presetVirtualDevice=true` 保持不变（Ascend950DT 必须 VNPU 模式，不支持 presetVirtualDevice=false）。
+
+**涉及组件**：`ascend-k8sdeviceplugin:v26.1.0.beta.2`
+
+**注意**：此 daemonset 不在 `ascend-ci-deployment` ArgoCD 管理范围内，是手动 `kubectl apply` 部署的。如果未来重新 apply 旧 YAML 会覆盖此修复。
+
+##### 11. 云下机器无法连接外网
 
 **现象**：云下机器链接外网完全不通
 
