@@ -198,8 +198,8 @@ K8s：v1.32.13
 ### 3.3 云下安装 Ascend 组件 （基础设施开发 & mindcluster 同事）
 
 1. 安装 Ascend Docker Runtime（升级到 v26.1.0.beta.2 匹配 Device Plugin）
-2. 部署 Device Plugin DaemonSet（volcanoType=true, presetVirtualDevice=true）
-3. 安装 volcano 昇腾插件
+2. 部署 Device Plugin DaemonSet（volcanoType=false, presetVirtualDevice=true）—— 已修复（见问题 #10）
+3. 安装 volcano 昇腾插件 —— **未安装**（暂不需要，volcanoType 已关）
 
 ### 3.4 接入 K8s（基础设施开发）
 
@@ -369,17 +369,49 @@ device plugin 文件日志（`/var/log/mindx-dl/devicePlugin/devicePlugin.log`�
 
 **解决**：Device plugin daemonset args 改 `-volcanoType=true` → `-volcanoType=false`，`-presetVirtualDevice=true` 保持不变（Ascend950DT 不支持 `presetVirtualDevice=false`）。
 
-```bash
-kubectl patch ds -n kube-system ascend-device-plugin-daemonset --type json -p='[{
-  "op": "replace",
-  "path": "/spec/template/spec/containers/0/args/0",
-  "value": "...;device-plugin -volcanoType=false -presetVirtualDevice=true ..."
-}]'
+集群当前实际运行参数：
+```
+device-plugin -volcanoType=false -presetVirtualDevice=true -logFile=/var/log/mindx-dl/devicePlugin/devicePlugin.log -logLevel=0 --enable-healthz=true --healthz-address=11251
 ```
 
-**涉及组件**：`ascend-k8sdeviceplugin:v26.1.0.beta.2`（imagePullPolicy: Never，本地预加载）
+**涉及组件及版本**：
 
-**注意**：此 daemonset 不在 `ascend-ci-deployment` 或 `resource-deploy-core` 的 ArgoCD 管理范围内，是手动 `kubectl apply` 部署的。`resource-deploy-core/docs/daemonsets/ascend-device-plugin-daemonset.yaml` 里有参考 YAML（910 版本），但上海的 variant（名字、image、selector、args 均不同）未被任何仓库追踪。如果未来重新 apply 旧 YAML 会覆盖此修复。**建议**：把这个 daemonset 加入 `ascend-ci-deployment` 的 ArgoCD 管理。
+| 组件 | 镜像 | 备注 |
+|------|------|------|
+| Device Plugin | `ascend-k8sdeviceplugin:v26.1.0.beta.2` | `imagePullPolicy: Never`，本地预加载 |
+| Volcano Controller | `docker.io/volcanosh/vc-controller-manager:v1.12.0-v26.1.0.beta.2` | nodeSelector: master-01 |
+| Volcano Scheduler | `docker.io/volcanosh/vc-scheduler:v1.12.0-v26.1.0.beta.2` | nodeSelector: master-02 |
+| Volcano Admission | `docker.io/volcanosh/vc-webhook-manager:v1.15.0` | nodeSelector: master-03，与 scheduler/controller 版本不同 |
+| NPU Scheduler (ARCSync) | `swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/scheduler-plugins:025fc15...` | hostNetwork: true，仅调度 runner pod |
+
+**vnpu.cfg**（全 4 节点一致）：
+```
+vnpu_config_recover:enable
+[vnpu-config start]
+dev0:0-7
+dev1:0-3
+dev2:4-7
+[vnpu-config end]
+```
+
+**Vulcano 调度器 ConfigMap**（当前已恢复为原生配置，无 deviceshare 插件）：
+```yaml
+actions: "enqueue, allocate, backfill"
+tiers:
+- plugins:
+  - name: priority
+  - name: gang
+  - name: conformance
+- plugins:
+  - name: overcommit
+  - name: drf
+  - name: predicates
+  - name: proportion
+  - name: nodeorder
+  - name: binpack
+```
+
+**注意**：此 daemonset 不在 `ascend-ci-deployment` 或 `resource-deploy-core` 的 ArgoCD 管理范围内，是手动 `kubectl apply` 部署的。如果未来重新 apply 旧 YAML 会覆盖此修复。
 
 ##### 11. 云下机器无法连接外网
 
