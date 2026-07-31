@@ -278,33 +278,108 @@ K8s：v1.32.13
 
 ##### 10. Device Plugin volcanoType=true 致 1/2/4 卡 Pod 全部 UnexpectedAdmissionError（仅 8 卡正常） 🔥
 
-**发现时间**：2026-07-30
+**发现时间**：2026-07-29，持续到 2026-07-30 修复
+
+**触发条件**：ArgoCD 同步了 Volcano 配置调整（7/29 11:00 左右），虽然这不是根因但排查初期误导了方向（详见排查过程第 6 步）。
+
+---
 
 **现象**：
-- 1、2、4 卡 pod 稳定报 `UnexpectedAdmissionError: Allocate failed due to rpc error: code = Unknown desc = not get valid pod`
-- 8 卡 pod 完全正常
-- 无论 Volcano 还是默认调度器均受影响
-- 重启 device plugin daemonset、清空 vcjob-fault-npu-cm、修改 vnpu.cfg 均无效
+
+Runner pod（非 NPU）能正常启动，但 workflow pod（请求 NPU）稳定失败：
+```
+Pod status: Failed (UnexpectedAdmissionError)
+Pod was rejected: Allocate failed due to rpc error: code = Unknown desc = not get valid pod, which is unexpected
+```
+
+规律：**1、2、4 卡全部报这个错误，只有 8 卡正常 Running。** 与调度器无关（切默认调度器同样失败）。
+
+---
+
+**排查过程**：
+
+1. **检查 Kubelet 事件** — pod 被 `Successfully assigned` 到节点，但立即 `UnexpectedAdmissionError`。说明调度成功，失败在 Kubelet 的 admission 阶段——即 device plugin 的 `Allocate()` gRPC 调用。
+
+2. **检查 device plugin 版本和配置** — 版本 `ascend-k8sdeviceplugin:v26.1.0.beta.2`，daemonset 自 Jul 22 起未重启（pod age 8d）。启动参数：`-volcanoType=true -presetVirtualDevice=true`。vnpu.cfg 内容：
+   ```
+   vnpu_config_recover:enable
+   dev0:0-7    # 8卡虚拟设备
+   dev1:0-3    # 4卡虚拟设备（物理 NPU 0-3）
+   dev2:4-7    # 4卡虚拟设备（物理 NPU 4-7）
+   ```
+   vnpu.cfg 全 4 节点一致，创建于 Jul 21，当前内容与当初无变化。
+
+3. **查 device plugin 日志文件**（`/var/log/mindx-dl/devicePlugin/devicePlugin.log`）— 关键发现：最后一条成功 Allocate 在 **7/28 19:59**（4 卡），第一条失败在 **7/29 09:40**。成功日志完整链路：
+   ```
+   request: ["npu-2","npu-4","npu-3","npu-5"]    ← Kubelet 随机选了 4 个物理 NPU
+   vol found: ["npu-0","npu-1","npu-2","npu-3"]   ← filter 匹配到虚拟设备 dev1
+   allocate resp env: 0,1,2,3                     ← 分配成功
+   ```
+   失败日志只有两行：
+   ```
+   pod add → request: ["npu-4","npu-5"] → no pod passed the filter → retry×3 → not get valid pod
+   ```
+   filter 找不到 pod，虽然 `pod add` 事件就在前 14ms。
+
+4. **对比历史** — 往前翻日志确认 **7/20-24 期间 1、2、4、8 卡全部正常**，甚至 2 卡也成功（返回值如 `1,2` / `0,1`）。同一个 vnpu.cfg、同一个 device plugin 版本。
+
+5. **排查 Vulcano** — 当时 Volcano scheduler/controllers/admission 恰好在 7/29 11:00 被 ArgoCD 重新 sync（`values.yaml` 有改动），且 scheduler 持续报 `failed to update root queue: admission webhook denied`。这看起来像切入点，但**后续验证排除了 Volcano**：
+   - 默认调度器下 2 卡同样失败 → 不是 Volcano 调度器问题
+   - 删掉 root queue（仿照正常工作的 GY004 集群） → Volcano 不再报错，但 2 卡依旧失败
+   - 给 Volcano 加上 `deviceshare` 插件（AscendMindClusterVNPUEnable） → 无效
+
+6. **排查 fault ConfigMap** — `vcjob-fault-npu-cm` 中 4 个 lab 节点全被标记为 `CardNetworkUnhealthy`，32 个 NPU 全部 `NetworkUnhealthyNPU`。但 `npu-smi info` 确认所有 NPU 硬件正常（Health: OK，温度功耗正常）。device plugin 的 RBAC 有 `configmaps: get, list, watch` 权限，Allocate 时会读这个 ConfigMap。清空后 → 无效。且这个 ConfigMap 在集群上存在了 9 天，而 Allocate 直到 7/29 才首次失败，不是根因。
+
+7. **排查 VNPU 配置** — 尝试 `-presetVirtualDevice=false` → device plugin CrashLoopBackOff，报 `only 310p, 910a2 and 910a3 support to set presetVirtualDevice false`。Ascend950DT 强制 VNPU 模式。
+
+8. **重启 device plugin daemonset**（全 4 节点 rolling restart）→ 无效，新 pod 同样 `no pod passed the filter`。
+
+9. **联系华为 mindcluster 同事分析** — 结论：`-volcanoType=true` 需要配合 Ascend for Volcano 插件使用。插件负责在调度阶段选出具体 NPU 设备并写回 pod annotation，device plugin 在 Allocate 时读这个 annotation。当前 Volcano 只装了原生开源版，没有这个插件 → pod 上无 annotation → filter 找不到 pod。8 卡不需要插件是因为全量分配无选择歧义。
+
+10. **验证修复** — daemonset args 改为 `-volcanoType=false -presetVirtualDevice=true`（关 volcanoType，保留 VNPU）。测试 2 卡、4 卡 pod → ContainerCreating → Running ✅。
+
+---
 
 **根因**：
-Device plugin 启动参数 `-volcanoType=true` 表示期望 Volcano 安装了 Ascend NPU 亲和性插件（deviceshare + AscendMindClusterVNPUEnable），由插件选出具体哪几个 NPU 并写回 pod annotation，Allocate 时 device plugin 读这个 annotation 来完成设备分配。但当前 Volcano 只装了原生开源版，没有 Ascend for Volcano 插件 → pod 上缺少设备选择 annotation → device plugin 的 filter（`plugin.go:888`）找不到 pod → `no pod passed the filter` → 3 次 retry 后 `plugin.go:1327 not get valid pod`。
 
-8 卡不受影响的原因：全节点 8 卡无需"选哪几个"，直接全量分配，不经过 filter。
+Device plugin 启动参数 `-volcanoType=true` 告诉它"从 pod annotation 读 NPU 设备选择信息"，但这个信息应由 **Ascend for Volcano 调度插件**写上去。当前集群 Volcano 只装了原生开源版，没有 Ascend NPU 亲和性插件 → pod 上缺少 annotation → device plugin 内 filter（`plugin.go:888`）迭代 pod indexer 找不到匹配 → `no pod passed the filter` → 3 次 retry 后 `plugin.go:1327 not get valid pod`。
 
-**关键日志**（device plugin container stdout）：
+8 卡不受影响：全节点 8 卡无需选择，直接全量分配，不经过 filter 逻辑。
+
+---
+
+**关键日志位置**：
+
+device plugin container stdout（filter 失败）：
 ```
-[INFO]  server/plugin.go:1316   request: []string{"npu-2", "npu-3"}
 [WARN]  server/plugin.go:888    no pod passed the filter, request device: [npu-2 npu-3], retry: 0
 [WARN]  server/plugin.go:888    no pod passed the filter, request device: [npu-2 npu-3], retry: 1
 [WARN]  server/plugin.go:888    no pod passed the filter, request device: [npu-2 npu-3], retry: 2
 [ERROR] server/plugin.go:1327   not get valid pod
 ```
 
-**解决**：Device plugin daemonset args 改 `-volcanoType=true` → `-volcanoType=false`，`-presetVirtualDevice=true` 保持不变（Ascend950DT 必须 VNPU 模式，不支持 presetVirtualDevice=false）。
+device plugin 文件日志（`/var/log/mindx-dl/devicePlugin/devicePlugin.log`，正常 Allocate 对比）：
+```
+[INFO] request: []string{"npu-2", "npu-4", "npu-3", "npu-5"}
+[INFO] vol found: []string{"npu-0", "npu-1", "npu-2", "npu-3"}     ← 7/28 成功有这行
+[INFO] allocate resp env: 0,1,2,3;
+```
 
-**涉及组件**：`ascend-k8sdeviceplugin:v26.1.0.beta.2`
+---
 
-**注意**：此 daemonset 不在 `ascend-ci-deployment` ArgoCD 管理范围内，是手动 `kubectl apply` 部署的。如果未来重新 apply 旧 YAML 会覆盖此修复。
+**解决**：Device plugin daemonset args 改 `-volcanoType=true` → `-volcanoType=false`，`-presetVirtualDevice=true` 保持不变（Ascend950DT 不支持 `presetVirtualDevice=false`）。
+
+```bash
+kubectl patch ds -n kube-system ascend-device-plugin-daemonset --type json -p='[{
+  "op": "replace",
+  "path": "/spec/template/spec/containers/0/args/0",
+  "value": "...;device-plugin -volcanoType=false -presetVirtualDevice=true ..."
+}]'
+```
+
+**涉及组件**：`ascend-k8sdeviceplugin:v26.1.0.beta.2`（imagePullPolicy: Never，本地预加载）
+
+**注意**：此 daemonset 不在 `ascend-ci-deployment` 或 `resource-deploy-core` 的 ArgoCD 管理范围内，是手动 `kubectl apply` 部署的。`resource-deploy-core/docs/daemonsets/ascend-device-plugin-daemonset.yaml` 里有参考 YAML（910 版本），但上海的 variant（名字、image、selector、args 均不同）未被任何仓库追踪。如果未来重新 apply 旧 YAML 会覆盖此修复。**建议**：把这个 daemonset 加入 `ascend-ci-deployment` 的 ArgoCD 管理。
 
 ##### 11. 云下机器无法连接外网
 
