@@ -411,7 +411,13 @@ tiers:
   - name: binpack
 ```
 
-**注意**：此 daemonset 不在 `ascend-ci-deployment` 或 `resource-deploy-core` 的 ArgoCD 管理范围内，是手动 `kubectl apply` 部署的。如果未来重新 apply 旧 YAML 会覆盖此修复。
+**参考配置文件**：集群实际运行配置已导出到 `ascend-ci-deployment` 仓库 `docs/clusters/sh-001/reference/` 目录：
+- `ascend-device-plugin-daemonset.yaml` — Device Plugin DaemonSet（含修复后的 `volcanoType=false`）
+- `vnpu.cfg` — VNPU 虚拟设备配置
+- `volcano-scheduler-configmap.yaml` — Volcano 调度器配置
+- `README.md` — 组件管理方式说明
+
+**注意**：Device Plugin DaemonSet 不在 ArgoCD 管理范围内，是手动 `kubectl apply` 部署的。如果未来重新 apply 旧 YAML 会覆盖此修复。
 
 ##### 11. 云下机器无法连接外网
 
