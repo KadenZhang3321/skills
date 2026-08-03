@@ -195,7 +195,7 @@ K8s：v1.32.13
 5. 从 master-01 scp 传输 kubeadm RPM 包并 rpm 安装
 6. `kubeadm join` 通过 ELB 加入集群
 
-### 3.3 云下安装 Ascend 组件 （基础设施开发 & mindcluster 同事）
+### 3.3 云下安装 Ascend 组件 （基础设施开发/对应业务部门 & mindcluster 同事）
 
 1. 安装 Ascend Docker Runtime（升级到 v26.1.0.beta.2 匹配 Device Plugin）
 2. 部署 Device Plugin DaemonSet（volcanoType=false, presetVirtualDevice=true）—— 已修复（见问题 #10）
