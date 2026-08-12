@@ -530,4 +530,13 @@ Pod → CoreDNS ClusterIP (10.96.0.10)    [断裂点1]
 **解决**：把ascend950DT的驱动库打包进ubuntu经i选哪个
 
 
+### 5.2 多机任务需要关系包签名认证
+
+### 5.1 多机服务没起来，因为包签名认证失败。
+
+**现象**：多机服务没起来，因为包签名认证失败。
+
+**解决**：参考https://gitcode.com/Ascend/memcache/wiki/%E6%B1%A0%E5%8C%96%E4%BD%BF%E8%83%BD950DT%E5%92%8C950PR%E7%9A%84UB%E5%92%8CUBoE.md ，关闭包签名认证
+
+
 
