@@ -71,6 +71,22 @@ k8s 对象之外、kubectl 不可见的共享盘（来源：彼文 du 盘点 / i
   3. **拨测挂载失败 ×2**：`19fa9411`（mind-third-ci）、`d5fa7449`（infra-gy，guiyang-002/ipv6 集群侧探的）——有挂载失败告警但水位 -1 不可知（网络/ACL 未放通）。
   4. **非 SFS 体系**：sh-002 静态 NFS `179.60.12.2`、sh-001 `suzblue:/share`(317T)/`:/weight`(358T)、suzeau/hk-ci——无 agent 或驱动不在 cronjob 范围。
   5. **归因真空**：kubelet `volume_stats` 全链路未采集（KSM 只有 requests 声明值）；nginx 各缓存 zone 实际大小、harbor registry 实际用量均无指标（squid 有 exporter 但仅 cn12/guiyang-001/002 job）→「盘用了多少」能看到，「谁用的」只能靠 Part II du 一次性任务。
+
+**逐盘：为什么没发现 → 该不该发现 → 后续怎么监控**
+
+| 盘 | 集群 | 没发现的原因 | 需要监控？ | 后续监控方案 |
+|---|---|---|---|---|
+| `45eb5e4c` | gy-006 | PV export host 写的是 IP（172.22.6.2），cronjob 发现过滤器只认 `*.sfsturbo.internal` → 整盘漏发现 | **必须**（nginx 缓存盘、issue 421G 现场，写爆零告警） | 改 cronjob：发现 key 取 `volumeAttributes["everest.io/volume-id"]`/`sfsturbo-share-id` 的 UUID，不看 host 形态 |
+| `95a3d42c` | gy-005 | 同上（IP host 172.22.5.x） | **必须**（#1706 拟 450G vs 500G，最敏感的一块） | 同上 |
+| `ba20b346` | aiframework | 同上（IP host 192.168.0.2） | 必须（nginx 缓存盘） | 同上 |
+| `d561f410`、`2c26b4ff`、`488cfc84`、`cf5c6fef`、`6a6b9cc9` | infra-gy-001 | host 其实是 `.sfsturbo.internal`（可被发现），但该集群（监控标签 guiyang-001）**cronjob/agent 根本没在跑**（中心 0 序列） | 必须（`d561f410` 3.6T/用 2.0T + harbor 盘） | 补部署 `cronjob-sfs-turbo-disk` + 核查 pushgateway 连通/凭据；wlcb-001 同理（有 config 无数据，需现场核查） |
+| `19fa9411` | mind-third-ci | 已发现但**挂载探测失败**（mount_ok=0→usage=-1）：cronjob Pod 所在节点到该 SFS 的 NFS 未放通（安全组/VPC ACL） | 需要（3 个 10Ti 占位 claim 身份不明，先盘清再决定） | 在告警外排查：节点安全组放行 2049；若盘已废弃→删 PV 释放（连带孤儿 claim） |
+| `d5fa7449` | infra-gy-001（guiyang-002/ipv6 侧探测） | 同上挂载失败（跨集群引用，探测方网络域不对） | 低优先 | 随 infra-gy-001 补部署一并解决（就近节点探测） |
+| `070878d2`、`7fcef8a8` | guiyang-002（infra-guiyang-ipv6-002） | 已发现但挂载失败（-1） | 待认领（不在本次 27 块 k8s 清单内） | 该集群负责人核查 ACL 或退役 |
+| `179.60.12.2` | sh-002 | cronjob 只匹配 `sfsturbo.csi.everest.io` 驱动，静态 `nfs` PV 不在发现范围；且 sh-002 无 agent | 需要（5 个 CI share-pvc 在其上） | 发现逻辑扩到 `.spec.nfs`；sh-002 部署 agent 或并入 cn4 拨测 |
+| `suzblue.server:/share`、`:/weight` | sh-001 | hostPath 直挂 NAS，无任何 PV/PVC 对象可发现；sh-001 无监控 agent | **需要**（317T 人用混挂盘、modelscope 11.9T 无清理器，issue 验收项同源） | 在 lab 节点起 node-exporter filesystem collector（suzblue 已挂载即可见），或加一次性 df CronJob 推 pushgateway；NAS 侧用华为/厂商自带监控接口 |
+| `23021270` | gy-003/005 | 已发现（ok）但状态是 **100% 爆满** | 短期保留告警，长期**退役**（疑似 b46/24dd 的镜像旧盘） | 治理：确认无引用后随模型清理流程下线，替代方案=扩容或并入 b46afb97 |
+
 - **顺手可修的监控 bug**：① `shared_disk_available_bytes` 实为 `df -P` 的 **1K 块数**，指标名/换算是错的（差 1024×）；② 发现过滤器建议改为从 `volume-id`/`sfsturbo-share-id` 属性取 UUID（不依赖 export host 形态）。
 
 ## 3. nginx max_size 收紧生效核对（live ConfigMap，2026-09-18）
