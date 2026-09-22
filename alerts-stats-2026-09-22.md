@@ -9,7 +9,6 @@
 
 | 告警名 | 集群 | 对象数 | 最长持续触发(h) | 累计触发时长(h) |
 |---|---|---|---|---|
-| CloudAccountUnreachable | infra-monitoring | 1 | 72.0 | 72.0 |
 | GitHubProxyUnreachable | guiyang-002 | 1 | 72.0 | 72.0 |
 | GitHubProxyUnreachable | guiyang-006 | 1 | 72.0 | 72.0 |
 | GitHubUnreachable | guiyang-002 | 1 | 72.0 | 72.0 |
