@@ -46,9 +46,12 @@
 
 ---
 
+## 总表（按类别拆成 5 张；列定义与图例见上文，横向 23 个业务不变）
+
+### 1. ▍服务类｜平台对外提供的能力（业务直接调用的入口）
+
 | # 服务 / 诉求 | 1 vllm-ascend（含 nv-action fork） | 2 vllm-omni | 3 vllm-ascend-recipes | 4 sglang（sgl-project+omni+Ascend/sglang） | 5 sgl-kernel-npu | 6 triton-ascend | 7 tilelang（+mlir） | 8 verl（+uni-agent/SpeCo/omni） | 9 Ascend/pytorch | 10 ms-swift | 11 LLaMA-Factory | 12 FLA | 13 ROLL + AReaL | 14 MindSpeed 系（llm/mm/bridge/ops） | 15 Megatron-Adapter | 16 OpPlugin + CANN | 17 SDK 系（vision/driving/rag/rec/index/multimodal + MindStudio） | 18 FSDPTurbo | 19 MemFabric/MemCache | 20 SLIME-Ascend | 21 openUBMC | 22 ascend-datasync | 23 Argo 流水线租户 |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| **▍服务类｜平台对外提供的能力（业务直接调用的入口）** |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
 | **S1 ARC 自托管 runner** | ●● | ▲ Buildkite agent-stack | ●● | ●● | ●●（新旧两代栈） | ●● | ●● | ●● | ●● | ●● | ●● | ●● | ●● | ? | ? | ? | ? | ? | ? | ? | ? | ? | ▲ 自建 CI（非 ARC） |
 | **S2 CI 引擎自带（Argo Workflows/Woodpecker）** | — | — | — | — | — | — | — | — | — | — | — | — | — | ? | ? | ? | ? | ? | ? | ? | ? | ? | ●●（gy-001/gy-002/wlcb 均有 `argo` ns） |
 | **S13 squid 出网代理 + CA 注入（`squid-ca-cert` + 6 个 CA env + `NO_PROXY` 绕 GHA 控制面）** | ●● 全套 | ●● | ● | ●● | ●● | ●●（buildkit 模板） | — | ▲ 裸 IP 代理 `100.68.174.87:3128`（GPU 线） | ● | ● | ● | ● | — | ●●（ns 在 `caNamespaces` 名单内） | ●● | ●●（含 `.gitcode` 绕行需求） | ●● | ●● | ●● | ●● | ●● | ●● | ●● |
@@ -59,7 +62,11 @@
 | **S19 SWR 私有镜像 + `huawei-swr-image-pull-secret-model-gy`（含 quay.io/docker.io 双向）** | ●● 双 pull secret | ●● | ●● | ●● SWR+docker.io | ●●（`model-cn12`） | ●● SWR+quay | ●● SWR | ●● SWR+quay | ●● SWR(cn-north-4) | ●● docker.io | ●● docker.io+quay | ●● docker.io | ●● quay.io | ? | ? | ●● | ? | ? | ? | ? | ? | ? | ? |
 | **S20 Vault / secret-manager（GitHub App、OBS AK/SK、buildkit 证书、TLS）** | ●● | ●● buildkite token | ●● | ●● | ●● | ●● | ●● | ●● | ●● | ●● | ●● | ●● | ●● | ? | ? | ●● | ? | ? | ? | ? | ? | ? | ? |
 | **S21 buildkitd 远程构建（mTLS + dispatcher + KEDA + fuse）** | ●●（hk cpu-16/32） | — | — | ● | ● | ●●（`cpu-4-buildkit` 专用 runner） | — | — | — | — | — | — | — | ? | ? | ●●（CANN 镜像构建本体） | ? | ? | ? | ? | ? | ? | ? |
-| **▍资源类｜算力 · 存储 · 调度（决定任务能不能落到卡上）** |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+
+### 2. ▍资源类｜算力 · 存储 · 调度（决定任务能不能落到卡上）
+
+| # 服务 / 诉求 | 1 vllm-ascend（含 nv-action fork） | 2 vllm-omni | 3 vllm-ascend-recipes | 4 sglang（sgl-project+omni+Ascend/sglang） | 5 sgl-kernel-npu | 6 triton-ascend | 7 tilelang（+mlir） | 8 verl（+uni-agent/SpeCo/omni） | 9 Ascend/pytorch | 10 ms-swift | 11 LLaMA-Factory | 12 FLA | 13 ROLL + AReaL | 14 MindSpeed 系（llm/mm/bridge/ops） | 15 Megatron-Adapter | 16 OpPlugin + CANN | 17 SDK 系（vision/driving/rag/rec/index/multimodal + MindStudio） | 18 FSDPTurbo | 19 MemFabric/MemCache | 20 SLIME-Ascend | 21 openUBMC | 22 ascend-datasync | 23 Argo 流水线租户 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | **S3 NPU 驱动 + 资源名**（`ascend-1980`/`huawei.com/npu`/`Ascend910`/`ascend-310`/vNPU 切片） | ●● 全谱+vNPU | ●● | ●● a2b4/a5/800i | ●● a3/800t/a5 | ●● a3/800i/800t/a5+旧 `npu-*` | ●● | ●● A5 | ●● `Ascend910`/1980 | ●● a3/800i/a5 | ●● a2 | ●● a2 | ●● a2 | ●● a3/800i | ?（整机多卡） | ? | ? | ? | ? | ? | ? | — | ? | ? |
 | **S4 npu-scheduler（runner 层）** | ●●（+`-nofifo`） | ●● | ●● | ●● | ●●（含旧 `runner-pod-npu-scheduler`） | ●● | ●● | ●● | ●● | ●● | ●● | ●● | ●● | ? | ? | ? | ? | ? | ? | ? | ? | ? | ? |
 | **S5 volcano gang + Queue 配额** | ●● `vllm-queue` | ●● | ● | ●● `sglang-queue`/`sglang-npu-cn12-queue` | ●● `sgl-kernel-npu-cn12-queue` | ●● | ●● | ●● `verl-queue` | ●● | ●● | ●● | ●● | ●● | ? | ? | ? | ? | ? | ? | ? | ? | ? | ? |
@@ -70,14 +77,22 @@
 | **S10 模型权重/大盘（`/mnt/weight`、`/mnt/share`、`/data`、共用大盘）** | ●● | ●● 强制离线 | ●● | ●● | ● | ● | — | ●● modelscope 目录断言 | ● | ● | ● | ● | ● | ? | ? | ? | ? | ? | ? | ? | — | ●● | ? |
 | **S11 sfs-local-provisioner（bind 到 hostPath）** | ●● | ●● | ●● | ●● | ●● | ●● | ●●(NFS 替代) | ●● | ●● | ●● | ●● | ●● | ●● | ? | ? | ? | ? | ? | ? | ? | ? | ? | ? |
 | **S12 本地盘/独立 work PVC（`csi-disk`/`sfsturbo-subpath-sc`）** | ●● 64Gi | ●● | ● | ●● | ●● legacy | ● | ● | ● | ● | ● | ● | ● | ● | ? | ? | ? | ? | ? | ? | ? | ? | ? | ? |
-| **▍业务诉求类｜业务自带的需求（不是平台默认就有）** |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+
+### 3. ▍业务诉求类｜业务自带的需求（不是平台默认就有）
+
+| # 服务 / 诉求 | 1 vllm-ascend（含 nv-action fork） | 2 vllm-omni | 3 vllm-ascend-recipes | 4 sglang（sgl-project+omni+Ascend/sglang） | 5 sgl-kernel-npu | 6 triton-ascend | 7 tilelang（+mlir） | 8 verl（+uni-agent/SpeCo/omni） | 9 Ascend/pytorch | 10 ms-swift | 11 LLaMA-Factory | 12 FLA | 13 ROLL + AReaL | 14 MindSpeed 系（llm/mm/bridge/ops） | 15 Megatron-Adapter | 16 OpPlugin + CANN | 17 SDK 系（vision/driving/rag/rec/index/multimodal + MindStudio） | 18 FSDPTurbo | 19 MemFabric/MemCache | 20 SLIME-Ascend | 21 openUBMC | 22 ascend-datasync | 23 Argo 流水线租户 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | **R3 零卡控制面 runner（`*-0`：a3-800t-0 / a2b3-0 / a5-0）** | ●●（LWS 编排 + 模型下载） | ● | ●● | ●● | ●●（`cpu-0`） | ●（buildkit 有 CPU runner） | — | ●●（`a3-800i-0` 多机控制器） | — | — | — | — | ●●（`a3-0` CPU job） | ? | ? | ? | ? | ? | ? | ? | ? | ? | — |
 | **R4 模型/数据集下载与预置（`modelscope download`、`HF_ENDPOINT=hf-mirror.com`、`model_dataset_list.json`+PR label 触发、`tc` 限速 pod）** | ●● | ●● 全离线 | ●● | ●●（`SGLANG_USE_MODELSCOPE`） | ● | ●（wheel 为主，模型少） | ●（宿主缓存） | ●●（数据集文件断言 + `HF_TRANSFER=0`） | ●● | ●● `MODELSCOPE_CACHE` | ●● `HF_TOKEN` | ●● | ●● | ? | ? | ? | ? | ? | ? | ? | ? | ●● | ? |
 | **R5 编译缓存（ccache / pre-commit / csrc / LLVM，受内存与 NFS flock 语义约束）** | ●● pre-commit 走 OBS 远端缓存 | ● | — | ●● rust 扩展 seed-cache workflow | ●● | ●● ccache+`~/.triton/llvm`（OOM 限制并发 ≤6/≤8） | ●● 需 runner 预装 ccache（`-M 20G`） | ● | ●● 宿主 `/data/torchnpu-ccache` | — | — | — | ● | ? | ? | ●● | ? | ? | ? | ? | ●● | ? | ? |
 | **R6 apt/系统装包（`sudo apt-get install`、nodesource、docker CLI 预热）** | ●● gh/git/jq | ● | ● | ●●（`npu_ci_install_dependency.sh`） | ●● | ●● clang（+华为云 docker-ce 预热 `install-docker-cli` Job） | ● | ● | ●● openEuler/Ubuntu 双态 | ●● nodesource | ●● | ● | ● | ? | ? | ●● | ? | ? | ? | ? | ? | ? | ? |
 | **R7 privileged / hostNetwork / `--device /dev/davinci*`** | ● | ●●×4 | ● | ●● PD hostNetwork+privileged | ● | ●（docker `--network host`） | ● | ●● | ●● 8 卡直通+label 关闭 | ●● 整机 4 卡直通 | ● | ● `--shm-size 16g` | ● | ? | ? | ? | ? | ? | ? | ? | ? | ? | ? |
 | **R8 镜像构建与推送（buildx/QEMU/manifest，推 SWR/quay/docker.io）** | ●● nightly+main2main 镜像 | ● | ● | ●● 多 arch 镜像 | ●● kernel wheel | ●● SWR+quay+obs pypi index | ●（dist 在 hosted） | ●● quay.io/ascend/verl | ●● SWR frameworkptadapter | ●● docker_npu | ●● docker.io+quay | — | — | ? | ? | ●● CANN 容器镜像 | ? | ? | ? | ? | ●● | ? | ? |
-| **▍运营类｜治理、保障与协作约定（做错会大面积变红）** |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+
+### 4. ▍运营类｜治理、保障与协作约定（做错会大面积变红）
+
+| # 服务 / 诉求 | 1 vllm-ascend（含 nv-action fork） | 2 vllm-omni | 3 vllm-ascend-recipes | 4 sglang（sgl-project+omni+Ascend/sglang） | 5 sgl-kernel-npu | 6 triton-ascend | 7 tilelang（+mlir） | 8 verl（+uni-agent/SpeCo/omni） | 9 Ascend/pytorch | 10 ms-swift | 11 LLaMA-Factory | 12 FLA | 13 ROLL + AReaL | 14 MindSpeed 系（llm/mm/bridge/ops） | 15 Megatron-Adapter | 16 OpPlugin + CANN | 17 SDK 系（vision/driving/rag/rec/index/multimodal + MindStudio） | 18 FSDPTurbo | 19 MemFabric/MemCache | 20 SLIME-Ascend | 21 openUBMC | 22 ascend-datasync | 23 Argo 流水线租户 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | **S18 出网白名单（NGFW 域名白名单 / 安全组端口 /  apiserver ELB 白名单 / 中心监控 IP 放行）** | ●●（需 kubectl→apiserver 白名单） | ●● | ●● | ●●（PD 需 8000/8995/HCCL 端口段） | ●● | ●● | ● | ●●（suzhou hostNetwork） | ●● | ●● | ●● | ●● | ●● | ●●（gy-002/wlcb 出口被 NGFW 挡过，拨测才改指集群内 git-cache） | ●● | ●● | ●● | ●● | ●● | ●● | ●● | ●● | ●● |
 | **S23 NTP 时钟 + CoreDNS forward（`dnsPolicy: None`/resolv.conf 覆写特例）** | ●●（时钟偏 8h→JWT 401） | ●● | ●● | ●● | ●● | ●● | ●● | ●● ▲ 覆写 `/etc/resolv.conf` 指 `10.247.3.10` | ●● | ●● | ●● | ●● | ●● | ●● | ●● | ●● | ●● | ●● | ●● | ●● | ●● | ●● | ●● |
 | **R1 时间窗/独占污点（`dedicated=night`、`752t`、`single-node`、`cache=true`、`node.usage.notes=…download_large_model`）+ **业务 workflow 里定时摘污点**** | ●● 唯一有摘污点逻辑：`schedule_nightly_test_a2/a3.yaml` 的 `remove-taints` job 跑 `kubectl taint nodes ${{vars.A2/A3_TAINT_NODES}} dedicated-` | ● 容忍 | ● | ●●（`dedicated` 在 sglang LWS 模板里） | ●● | — | ▲ `huawei.com/schedule_policy: chip4-node8` | ●（suzhou 独占） | ● | — | — | — | — | ? | ? | ? | ? | ? | ? | ? | ? | ? | ? |
@@ -85,8 +100,13 @@
 | **R9 维护窗口 / 门禁（`NIGHTLY_COMMAND_BLOCK_WINDOW`、nginx rollout gate、暂停 CI）** | ●● | — | — | ● | ● | ● | — | — | — | — | — | — | ▲ `PREPARE_JOB_TIMEOUT=43200` | ? | ? | ? | ? | ? | ? | ? | ? | ? | ? |
 | **R10 仓库侧必须先建的 secrets/vars** | ●● `KUBECONFIG_*_B64`、`OBS_ACCESS_KEY_ID/SECRET(_PRECISION)`、`HW_OBS_AK/SK`、`SWR_USERNAME/PASSWORD`、`SYNC_TOOLS_TOKEN`、`PAT_TOKEN`、`QUAY_CI_*`、`A2/A3_TAINT_NODES`、`NIGHTLY_COMMAND_BLOCK_WINDOW` | ● `BUILDKITE token` | ● | ●● `OBS_*`、`QUAY_*` | ●● | ●● `QUAY_*`+APIG AppCode | ● | ●● `DEEPSEEK_API_KEY`、`DEV_SUBMITTER_TOKEN` | ●● `ACCESSKEY/SECRETACCESSKEY` | ●● `MODELSCOPE_API_TOKEN` | ●● `HF_TOKEN`、`DOCKERHUB_*` | ● | ●● | ? | ? | ? | ? | ? | ? | ? | ? | ? | ? |
 | **S22 观测：prometheus-agent→中心 / 拨测 CronJob / npu-exporter / node-exporter / KSM / runner 清理 / 模型缓存清理** | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ? | ? | ? | ? | ? | ? | ? | ? | ? | ? |
-| **▍分布｜该业务实际跑在哪些集群** |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+
+### 5. ▍分布｜该业务实际跑在哪些集群
+
+| # 服务 / 诉求 | 1 vllm-ascend（含 nv-action fork） | 2 vllm-omni | 3 vllm-ascend-recipes | 4 sglang（sgl-project+omni+Ascend/sglang） | 5 sgl-kernel-npu | 6 triton-ascend | 7 tilelang（+mlir） | 8 verl（+uni-agent/SpeCo/omni） | 9 Ascend/pytorch | 10 ms-swift | 11 LLaMA-Factory | 12 FLA | 13 ROLL + AReaL | 14 MindSpeed 系（llm/mm/bridge/ops） | 15 Megatron-Adapter | 16 OpPlugin + CANN | 17 SDK 系（vision/driving/rag/rec/index/multimodal + MindStudio） | 18 FSDPTurbo | 19 MemFabric/MemCache | 20 SLIME-Ascend | 21 openUBMC | 22 ascend-datasync | 23 Argo 流水线租户 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | **实际在跑的集群** | hk-001、cn12、gy-001/003/005/006、sh-001（+wlcb/gy-004 offload） | cn12、hk、gy-003、sh-001 | cn12、gy-001、sh-001 | hk、cn12、gy-004、sh-002 | hk、cn12、gy-004、sh-002 | cn12、hk、gy-001、gy-005、sh-002 | sh-002 | cn12、hk、mind-third、verl-suzhou | cn12、aiframework、gy-005、sh-002 | hk | hk | hk | cn12 | **gy-001、gy-002、wlcb-001**（`mindspeed`/`-llm`/`-mm`/`-bridge`/`-ops`） | **gy-001、gy-002、wlcb-001** | **gy-001、wlcb-001**（`op-plugin`；`cann` 仅 wlcb） | **gy-001、gy-002、wlcb-001**（`visionsdk`/`drivingsdk`/`ragsdk`/`recsdk`/`indexsdk`/`multimodalsdk`/`mindstudio`） | **gy-002、wlcb-001**（`fsdpturbo`） | **gy-002、wlcb-001**（`memfabric-hybrid`/`memcache`） | **gy-001、wlcb-001**（`slime-ascend`） | **wlcb-001**（`openubmc`） | **wlcb-001**（`ascend-datasync`） | **gy-001、gy-002、wlcb-001**（`argo`） |
+
 
 ---
 
