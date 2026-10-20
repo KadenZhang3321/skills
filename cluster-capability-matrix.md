@@ -6,6 +6,46 @@
 **业务列**：1–13 = GitHub 仓库 CI（证据：`ascend-ci-deployment/projects|other` + 各仓库 `.github/workflows`、`.buildkite`）；14–23 = **gitcode / 内部仓库租户**（证据：`argocd/clusters/squid-rpardini/values-{gy-001,gy-002,wlcb-001}.yaml` 的 `caNamespaces` 名单 —— 这些命名空间不是本仓库部署的，其 CI 定义在 gitcode/内部流水线，本地无仓库，故多数格为 `?`，需向对应团队收一次诉求清单）
 **行**：纵向 = 基础设施提供的服务（S*）+ 业务侧诉求（R*）
 
+## 服务与诉求速查（先看懂这些，再查总表）
+
+| 编号 | 用途 / 目的（一句话） | 缺了或做错会怎样（现网实证） |
+|---|---|---|
+| S1 ARC 自托管 runner | 把 GitHub Actions 的 job 落到 K8s + NPU 节点上执行 | 没有它 CI 无处运行；`runs-on` 标签与 scale set 标签不一致 → job 永远 waiting |
+| S2 租户自建 CI 引擎（Argo 等） | 不走 GHA 的内部/gitcode 租户自带流水线，集群只供算力与出网 | 按 ARC 思路给这类集群装 runner 属于白装，需求方用不上 |
+| S3 NPU 驱动 + 设备插件（资源名） | 让 pod 能申请到具体的卡（`ascend-1980`/`npu`/`Ascend910`/`ascend-310`） | 资源名写错（曾写 `huawei.com/ascend-a5`）→ volcano 永久 Unschedulable；驱动/ADR/DCMI 版本不配套 → `dcmi init failed -8255` |
+| S4 npu-scheduler | runner 层按卡槽位与 runner 同步选节点，避免多个 runner 抢同一张卡 | runner 落错节点、卡冲突、Pending；nightly 需要 `-nofifo` 变体 |
+| S5 volcano + Queue | job 层 gang 调度（整机多卡一起成功或一起等）+ 按团队配额 | 无 gang → 多机任务半启动死锁；无 queue → 一个业务吃光全集群卡 |
+| S6 LeaderWorkerSet | 编排"1 leader + N worker"的多机推理 / PD 分离形态（含 headless service） | 多机 nightly 与 PD 分离测试无法创建，控制器 job 里 `kubectl apply` 直接报 no resource |
+| S7 Liqo offloading | 把 A 集群的 pod 甩到 B 集群的卡上跑（跨集群借卡） | 卡不够时无处溢出；两侧 PVC/hostPath 不同名 → offload pod 卡死（gy-004 曾发生） |
+| S8 Karpenter 弹性 CPU 池 | CPU 类 job（lint/构建/控制面）高峰扩 ECS、闲时缩回 | 常驻节点被基础服务占死、弹性节点缩不回；顺序搞反（先加污点）→ 存量 pod 全 Pending |
+| S9 共享缓存盘 `/root/.cache` | pip 包、pre-commit、日志、模型缓存跨 pod / 跨 job 复用 | 每个 job 重下几十 G；439G 权重被误标删除后当晚全量重下的事故 |
+| S10 模型权重盘 / 公共大盘 | 离线跑测所需的模型与数据集仓库（`/mnt/weight`、`/mnt/share`、nv-action 大盘） | `HF_HUB_OFFLINE=1` 类任务直接失败；只读试点 runner 拿不到 huggingface/modelscope 子目录 |
+| S11 sfs-local-provisioner | 把 SFS export 挂到节点再 bind 成 `/mnt/sfs-local/<share>` 供 job 以 hostPath 使用（顺带防 NFS 根穿） | 弹性/新节点的挂载窗口导致 FailedMount；DaemonSet 不打 `cceaddon-volcano` 豁免标签会被 gang 连坐 |
+| S12 独立 work PVC（本地盘 / subpath） | 单 job 的工作区与编译中间物，避免挤占共享盘 | ephemeral-storage 不足被驱逐、构建中途失败 |
+| S13 squid（SSL-Bump 代理 + registry 缓存） | 集群唯一受控出网口 + 镜像层/包缓存，替代逐个申请公网白名单 | pip/docker/GitHub release 全超时；CA 指纹与客户端不一致 → TLS 握手失败；squid 挂 = buildkit 的 RUN 全 502（SPOF） |
+| S14 nginx-pypi-cache | 仓库内的多生态包缓存（pypi / torch / ascend repos + deb/rust/yum/go/crates 分端口） | CI 装依赖走公网，慢且不稳；现网 workflow **硬编码该 svc 名与端口**，改名等于业务全红 |
+| S15 git-cdn（GitHub） | 缓存 git smart-HTTP pack 与 LFS，让大仓 clone 又快又可重试 | 国内集群直连 github 被 WAF 掐（TLS 超时断连），大仓 checkout 反复失败 |
+| S16 gh-proxy / gitcode 通道 | GitHub release/raw 与 gitcode 仓库的另一条加速与取源路径 | gitcode 系租户拿不到源码与发布物；`clientMaxSize` 没调大则 push 报 413 |
+| S17 OBS/S3 通道 | 跨集群远端缓存（pre-commit/csrc）+ 制品与测试基线（精度用例、coverage、wheel 索引） | cache miss 触发全量重编译；精度/覆盖率基线缺失导致用例筛选失效 |
+| S18 各类白名单（出网/入网/中心） | 让链路可控：NGFW 域名白名单、安全组端口、apiserver ELB 白名单、中心监控放行 | 云下出口"默认丢弃"→ 拨测与 remote_write 静默断链、`GitHubProxyUnreachable` 假告警 |
+| S19 SWR 私有仓库 + pull secret | 分发昇腾定制镜像（runner / controller / ci-probe / nginx_pypi_cache 等） | 所有 pod ImagePullBackOff；arm64 集群撞上 amd64-only 镜像 → exec format error |
+| S20 Vault + secret-manager | 集中托管并下发凭据（GitHub App/token、OBS AK/SK、squid CA、buildkit 证书） | runner 拿不到 GitHub 凭据 → listener 无限崩重建；SecretDefinition 缺失 → scale set 起不来 |
+| S21 buildkitd + dispatcher + KEDA | 集中式镜像构建后端（mTLS、队列租约、按需扩容），业务侧无需特权 docker | CPU runner 里只能走 rootful/privileged 构建，风险大且互相挤占资源 |
+| S22 观测与治理任务 | 指标汇聚到中心 + 拨测 + NPU exporter + 僵尸 runner 清理 + 模型缓存清理 | CI 卡住/红灯无从定位；僵尸 EphemeralRunner 占坑挡住后续 job；缓存盘被撑爆 |
+| S23 NTP 时钟 + CoreDNS forward | 保证时间一致与域名可解析（节点与 pod 两层） | 时钟偏 8h → GitHub App JWT 401、listener 无限崩；CoreDNS 上游不可达 → pod 内解析失败、pip/git 全线超时 |
+| R1 时间窗 / 独占污点 | 用污点把夜间池、整机池、缓存节点圈出来，防止被普通负载抢走 | nightly 长任务被白天 PR CI 打断；缓存服务被挤到 NPU 节点上 |
+| R2 nodes patch 权限（kubeconfig） | 让业务 CI 能在时间窗结束时**摘掉污点**、把节点放回公共池 | 只有 toleration 没有摘污点能力 → 节点被永久独占（现网 workflow 的 `remove-taints` job 正是干这个） |
+| R3 零卡 runner（`*-0`） | 纯控制面 runner：跑 kubectl/LWS 编排、Ray 提交、模型下载，不占卡 | 编排任务挤占 NPU runner，或因卡数不匹配调度失败 |
+| R4 模型/数据集下载链路 | 把权重与数据集预置进共享盘（清单驱动 + 限速 + 专用节点） | 测试首次运行就要联网下几十 G；云下集群根本连不上 huggingface |
+| R5 编译缓存（ccache/csrc/pre-commit） | 避免每个 job 重编 C++ / LLVM / 算子 | triton-ascend 明确注释：并发开高就 OOM、并触发 buildkitd/SWR 认证超时 |
+| R6 apt/系统装包能力 | CI 需要 git/jq/clang/gh/docker CLI 等系统包 | 装包失败=后续步骤全红；openEuler 与 Ubuntu 还要分别走 8083/8081 |
+| R7 privileged / hostNetwork / 设备直通 | 整机卡直通、跨节点通信端口、DinD | ms-swift、verl、sglang-PD 这类用例跑不起来（EAI_NONAME、拿不到 `/dev/davinci*`） |
+| R8 镜像构建与推送 | 产出 nightly/release 镜像并推到 SWR/quay/docker.io | 业务没有可用运行镜像，CI 自身与下游用户都断供 |
+| R9 维护窗口与发布门禁 | 滚动缓存/代理组件时先让 CI 空跑，避免自杀式断流 | 发布即打断在跑 job；cn12 属"重型窗口"，必须暂停 CI + 暂停 Argo 同步 |
+| R10 仓库侧 secrets/vars 预配 | 凭据与变量先就位（kubeconfig、OBS、SWR、taint 节点清单、窗口开关） | 缺一项就是一片 job 起不来，或编排步骤 401/403 |
+
+---
+
 | # 服务 / 诉求 | 1 vllm-ascend（含 nv-action fork） | 2 vllm-omni | 3 vllm-ascend-recipes | 4 sglang（sgl-project+omni+Ascend/sglang） | 5 sgl-kernel-npu | 6 triton-ascend | 7 tilelang（+mlir） | 8 verl（+uni-agent/SpeCo/omni） | 9 Ascend/pytorch | 10 ms-swift | 11 LLaMA-Factory | 12 FLA | 13 ROLL + AReaL | 14 MindSpeed 系（llm/mm/bridge/ops） | 15 Megatron-Adapter | 16 OpPlugin + CANN | 17 SDK 系（vision/driving/rag/rec/index/multimodal + MindStudio） | 18 FSDPTurbo | 19 MemFabric/MemCache | 20 SLIME-Ascend | 21 openUBMC | 22 ascend-datasync | 23 Argo 流水线租户 |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | **S1 ARC 自托管 runner** | ●● | ▲ Buildkite agent-stack | ●● | ●● | ●●（新旧两代栈） | ●● | ●● | ●● | ●● | ●● | ●● | ●● | ●● | ? | ? | ? | ? | ? | ? | ? | ? | ? | ▲ 自建 CI（非 ARC） |
