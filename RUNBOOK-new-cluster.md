@@ -1,161 +1,188 @@
-# 新集群接入 Runbook（从零到"任务进去就能跑"）
+# 新集群接入 Runbook
 
-配套：`cluster-capability-matrix.md`（服务/诉求总表 + 依赖关系列）。
-文中 `/root/...` 为取证时的本地运维机路径；`ascend-ci-deployment` = https://github.com/opensourceways/ascend-ci-deployment 。
-**约束**：本 runbook 的编写全程只读；所有需要登集群的动作只写步骤与只读验收命令，由有权限的人执行。
+配套：`cluster-capability-matrix.md`（总表 + 速查表）。本文用的 `S*` / `R*` 代号与速查表一致。
+编写全程只读；所有需要登集群的动作只给步骤和**只读**验收命令，由有权限的人执行。
 
----
+## 0. 怎么用这份文档
 
----
+- 一条主线：**L0 底座 → L1 公共服务 → L2 社区接入 → L3 项目接入 → L4 运营**，一层一层过，每层有"出门条件"，不满足不进下一层。
+- 一条原则：**L1 不区分社区**（装完全集群共用）；**社区差异只落在 L2**（盘、权重、配额、卡池）；**仓库差异只落在 L3**（runner、凭据、代理注入）。
+- 一条纪律：外部资源（ELB、SFS、白名单、Vault 内容、Harbor 账号）是**日历时间**，在 L0 之前就要发起申请，不要等到要用了再提。
 
-## 分层交付模型（新集群按层交付，层间设门禁）
+## 1. 全流程一览
 
-> 核心原则：**L1 公共服务一次装好、不区分社区；社区差异全部下沉到 L2；仓库差异全部下沉到 L3。**
-> 与上面阶段的对应关系：阶段 0–1 = L0，阶段 2 = L1，阶段 3 前半 = L2、后半 = L3，阶段 4 = L3/L4。
-
-**L0 底座（集群级，一次性）**
-节点装机：驱动 + ADR + Device Plugin、containerd（双格式镜像加速）、openEuler resolv 软链、chrony/HTTP-Date 兜底、镜像预缓存、CNI 模式、apiserver ELB + certSANs、安全组与 NGFW 域名白名单、SFS/NFS/ELB 等外部资源。
-门禁（全绿才进 L1）：`date -u` 正确｜`allocatable` 里 NPU 资源名已确定｜CoreDNS forward 可解析外部域｜squid 需要的出网域名已放行｜`kubectl get nodes` 无 NotReady。
-
-**L1 公共服务层（不分社区，装完全集群共享）**
-按序：`S19 pull secret` → `S20 vault/secret-manager` → `S13 squid`（`caNamespaces` 先给平台 ns，社区 ns 在 L2 追加）→ `S14 nginx-pypi-cache`（svc 名与端口原样复刻）→ `S16 gh-proxy 验证` → `S15 git-cdn`（单副本）→ `S11 sfs-local-provisioner` + storageClass → `S3/S4/S5/S6`（设备+调度栈，含 LWS）→ `S7 Liqo`（如需）→ `S8 Karpenter`（先容忍后污点）→ `S1 ARC controller` → `S21 buildkitd` → `S22 观测/清理组件`。
-门禁：**与任何社区无关的公共冒烟** —— 起一个临时 pod 依次验证：`curl -x squid` 通 + CA 校验通过、`pip install -i <cache-service>` 命中 `X-Cache`、`git clone https://github.com/...` 走 git-cdn 且非零速断连、`buildctl build` 成功、`nvidia/npu` 资源申请成功、中心能看到该集群指标。
-
-**L2 社区接入层（每个社区一次）**
-- 建社区 ns + **共享缓存盘**（hostPath `/mnt/sfs-local/<share>` 或 PVC，**命名沿用跨集群同名约定**）
-- **权重/数据集同步**：跑零卡 runner 或 `sync-tools` 把模型/数据集预置进盘；云下走 `hf-mirror.com`，HK 走 `huggingface.co`；完成后核对只读子目录（`huggingface/`、`modelscope/`）存在
-- Queue capability/deserved 卡数配额、是否要独立卡池（`dedicated=night`/`752t`/`single-node`）
-- **登记台账**（见下表）：哪个社区、在哪个集群、哪个 share、权重就绪与否、由谁确认
-- 门禁：台账该行"权重就绪 = 是" + 抽查一次 `ls /root/.cache/modelscope/hub/models` 命中；否则该社区的离线类用例不许开放
-
-**L3 项目接入层（每个 org/repo）**
-runner scale set（标签与 `runs-on` 严格一致 + 标签手册登记）→ RBAC/SA → `github-app-secret.yaml`/`github-token-secret.yaml`（Vault 侧先有 key）→ `obs-cache-secret` → `squid-injection.py inject`（values + job PodTemplate 双侧）→ `git insteadOf` → 仓库侧 secrets/vars → 冒烟。
-门禁：RA/RC 覆盖检查通过 + 该仓库冒烟任务绿。
-
-**L4 运营层（持续）**
-时间窗执行与摘除（谁打谁摘）、发布窗口门禁（`nginx-cache-rollout-gate.py`）、两类清理任务（runner 僵尸 / 模型缓存）、告警值班、**台账维护与新社区追加**。
+| 层 | 目标 | 出门条件（全绿才进下一层） | 谁负责 |
+|---|---|---|---|
+| L0 底座 | 节点能调度、时间对、域名解析对、出入口通 | 节点全 Ready；`date -u` 正确；NPU 资源名确定；出网/入网白名单生效 | 运维 + 云 |
+| L1 公共服务 | 代理、包缓存、git 加速、调度栈、控制器就位（不分社区） | 第 3 节的 6 条公共冒烟全过 | 平台 |
+| L2 社区接入 | 该社区的盘、权重、配额、卡池就绪 | 台账该行"权重就绪 = 是" + 抽查目录命中 | 平台 + 社区 |
+| L3 项目接入 | 该 org/repo 的 runner、RBAC、凭据、代理注入就绪 | RA/RC 门禁通过 + 该仓库冒烟绿 | 项目 + 平台 |
+| L4 运营 | 持续：时间窗、发布、清理、告警、台账维护 | 值班与告警接上，无失明 | 平台 |
 
 ---
 
-## 社区层接入台账（现网已取证部分，新集群照此填写）
+## 2. L0 底座
 
-| 社区 | 集群 | 共享缓存盘（`/mnt/sfs-local/<share>` 或 PVC） | 权重/数据通道 | 离线依赖 | 状态 / 缺口 |
-|---|---|---|---|---|---|
-| vllm-project（vllm-ascend、vllm-omni，含 nv-action fork） | gy-001、gy-005、hk-001、cn12、gy-003、gy-006、sh-001 | `vllm-ascend-az5`、`gy005-az5-vllm-ascend-v2`、`vllm-project-hk001`、`nv-action-vllm-benchmarks-v2/-v3`、公共大盘 `ascend-ci-share-nv-action-vllm-benchmarks` | `/mnt/weight`、`/mnt/share`（sh-001/002 系）；`modelscope download` 清单 `misc/model_dataset_list.json`（a2/a3/310p/a5 分池） | vllm-omni `HF_HUB_OFFLINE=1`；vllm-ascend `VLLM_USE_MODELSCOPE` | 已登记。**大盘被 5+ 社区共用**，新集群要按公共盘对待 |
-| sgl-project（sglang、sglang-omni、sgl-kernel-npu）+ Ascend/sglang | hk-001、cn12、gy-004、sh-002 | `sgl-project-sglang-v2/-v3`、`sglang-guiyang004`、`ascend-ci-share-pkking-sglang`、`sgl-project-sgl-kernel-npu-liqo-v2`、`sglang-npu-sglang-v2/-v3` | `/data`（CPU job 缓存）；性能用例硬编码 `/root/.cache/modelscope/hub/models/...` 绝对路径 | 未见 `HF_HUB_OFFLINE`，但用例路径依赖预置 | 已登记。sh-002 走自建 NFS（`179.130.11.2`） |
-| volcengine（verl、uni-agent、verl-SpeCo、verl-omni） | hk-001、mind-third-ci、verl-suzhou、cn12、gy-001 | `hk001-v1`（整盘）、`verl-hb003`、`verl-project-liqo-cn12-001-v2`、`verl-uni-agent-hk001`、`verl-verl-speco-hk001`、`verl-project-verl-omni-gy001` | `/nfs/verl_ci`（suzhou）；数据集断言 `modelscope/hub/datasets/...` | ModelScope（`ms=Y`）+ 只读试点 runner（只挂 huggingface/modelscope 子目录） | 已登记。**三集群同名 hostPath 约定**，gy004 曾因名字错位卡死 |
-| Ascend（pytorch、sglang、cann-container-image、docs、ray-ascend） | cn12、aiframework、gy-005、sh-002、gy-001、hk-001 | `ascend-ci-share-pkking-pytorch`、`ascend-pytorch-share-pvc`、`gy005-az5-vllm-ascend-v2`、`ascend-cann-container-image`、`ascend-docs-cn12-001`、`hk001-v1` | `/data`；pytorch 产物走 `obs://pytorch-ci-cache` | — | 已登记。sh-002 自建 NFS |
-| triton-lang/triton-ascend（含 TecJesh、xuedinge233 fork） | cn12、hk-001、gy-001、gy-005、sh-002 | `ascend-triton-ascend-gy005`、`ascend-triton-ascend-hk001`、`triton-ascend-cn12-001-pvc`、`ascend-ci-share-nv-action-vllm-benchmarks` | 大文件走 OBS（Bisheng 编译器、wheel），非权重盘 | — | 已登记 |
-| tile-ai（tilelang、tilelang-mlir-ascend） | sh-002、cn12 | `tile-ai-tilelang-share-pvc`、`tile-ai-tilelang-ascend-gy005`、自建 NFS | — | 明确不用远端缓存，靠宿主 `runner.tool_cache` + ccache | 已登记。新集群需给本地大盘，否则退化裸编译 |
-| alibaba/ROLL、areal-project/AReaL | cn12 | `alibaba-roll-cn12-001`、`alibaba-roll-liqo-cn12-001-v2`、`areal-project-areal-shared-v3` | — | — | 已登记（AReaL 整盘挂载） |
-| HK a2 系（fla-org、hiyouga、modelscope、pt-ecosystem、UsernameFull） | hk-001 | `hk001-v1`（多社区共用整盘）、`fla-org-flash-linear-attention-a2-hk-001` | `MODELSCOPE_CACHE`；`HF_TOKEN`+`hf-mirror` | — | 已登记。**同盘并发写 → NFS flock 不互斥风险** |
-| 平台/组织级（ascend-gha-runners、cosdt、GanDing、opensourceways、agentic、cosdt-ci-test） | 13+ 集群 | `ascend-ci-share-ascend-gha-runners`、`ascend-gha-runners-gy001`、`ascend-gha-runners-vllm-ascend-gy006`、`cosdt-ci-test-gy001`、`opensourceways-gy001`、`ganding-rlinf-a2-hk-001`、`ascend-ci-share-cosdt`、gy-006 静态 PV `pvc-<uuid>` | `/mnt/weight`（sh-001）；`sync-tools` 是跨集群同步的执行者（`nv-action-vllm-benchmarks-v3`、`sgl-project-sglang-v2`） | — | 已登记 |
-| **gitcode / 内部租户（mindspeed 系、megatron-adaptor、op-plugin、cann、fsdpturbo、memfabric/memcache、六个 SDK + mindstudio、slime-ascend、openubmc、ascend-datasync、argo）** | gy-001、gy-002、wlcb-001 | **待登记** | 待登记；wlcb 的 `ascend-datasync` ns 看名字就是专职数据同步，可先从它要台账 | 待登记 | **最大缺口**：集群侧只能证明它们拿到 squid CA，其余需各团队给清单 |
+**输入**：机型清单（arch、NPU 型号与卡数）、OS、云与 region、期望 CNI、apiserver 入口（内网 + 公网 ELB）、存储类型（SFS / NFS / hostPath / harbor-sc）。
 
----
+**步骤**
 
-## 阶段 0：定形态与唯一输入（纸面，1 天）
+1. 申请外部资源：SFS/EVS 盘与 share-id、ELB/EIP、安全组端口（10250、CNI 4240/8472、NodePort 段）、NGFW 域名放行、中心监控放行 `113.44.182.82:9090/9091`。
+2. 节点装机：昇腾驱动 + Docker Runtime（ADR）+ Device Plugin，**版本必须配套**。
+3. containerd：v1.6 用 config.toml 老式 mirrors，v2.x 用 `certs.d/hosts.toml`；**改完重启 containerd**。
+4. OS 适配：openEuler 无 systemd-resolved → 建 `/run/systemd/resolve/resolv.conf` 软链。
+5. 时钟：chrony；UDP123 被封则装 HTTP-Date 兜底 timer。
+6. 镜像预缓存：pause、CNI、runner、busybox（走 `ctr images import`）。
+7. 网络：按拓扑选 CNI 模式（VPN/多网卡不要硬上 native routing）；Cilium 关 kube-proxyReplacement 时补 SNAT。
+8. apiserver 入口：ELB 绑定 + `certSANs` 覆盖**全部**入口 IP（所有 master 的管理面/服务面 IP + 两个 ELB IP）。
+9. 存储目录：按 share 名准备导出，并挂/bind 成 `/mnt/sfs-local/<share>`；NFS 子目录要预导出并 chmod。
+10. 缓存节点（若沿用单点模式）：打 `cache=true` label（污点按集群决定）。
 
-1. **选集群形态**（决定装不装 ARC/vault/buildkitd）：
-   - 全功能 CI 集群（对标 hk-001、cn12-001）
-   - 纯 Provider（对标 wlcb-001）：Liqo + npu-scheduler + 出网三件套 + provider 侧同名 PVC/RBAC + exporter
-   - 纯基础设施出口（对标 gy-002）：只有 squid + 监控，供别的租户用
-2. **写 `cluster.yaml`（新集群唯一输入）**，必填字段：
-   - region/云、节点 arch（是否有唯一 x86 节点）、OS（openEuler / Ubuntu）
-   - NPU 型号、卡数、**实际注册的资源名**（以 `kubectl describe node` 的 allocatable 为准，不以机型手册为准）
-   - CNI（Cilium/Calico、是否 native routing、是否 VPN 多网卡）
-   - apiserver 入口：内网地址 + 公网 ELB/EIP + **certSANs 全集**
-   - 存储：storageClass 类型（`sfsturbo-subpath-sc` / `csi-sfsturbo`+share-id / 自建 NFS / hostPath / `harbor-subpath-sc`）+ share 名清单
-   - 出网：是否被 NGFW 域名白名单限制、公网出口 IP（给中心 CN4 放行用）
-   - 控制面归属：中心 ArgoCD 还是该集群自建（现网存在 `destination: in-cluster` 的第二套控制面）
-   - **承载哪些业务**：从总表 23 列里勾选（含 14–23 的 gitcode/内部租户）
-3. **立刻发起外部申请**（日历时间最长，别等到装组件时才提）：SFS/EVS 盘与 share-id、ELB/EIP、安全组端口、NGFW 域名放行、Harbor/SWR 命名空间、Vault KV 录入、中心监控放行 `113.44.182.82:9090/9091`。
+**只读验收**
 
-## 阶段 1：节点与底座
+```bash
+kubectl get nodes                                     # 全 Ready，无 NotReady
+kubectl get node -o custom-columns=NAME:.metadata.name,ARCH:.status.nodeInfo.architecture,OS:.status.nodeInfo.osImage
+kubectl get node -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.allocatable}{"\n"}{end}'   # NPU 资源名以这里为准
+kubectl get cm coredns -n kube-system -o yaml | sed -n '/forward/,/}/p'
+date -u                                               # 每台节点都对
+```
 
-4. 节点装机（可复用 `resource-deploy-core` 的探测/join/`deploy_softwares` + 现网装机模板）：
-   - 昇腾驱动 + Ascend Docker Runtime + Device Plugin，**版本必须配套**（不配套 → `dcmi init failed -8255`）
-   - containerd 镜像加速：v1.6 用 config.toml 老式 mirrors；v2.x 用 `certs.d/hosts.toml`，**改完必须重启 containerd**
-   - openEuler 无 systemd-resolved → 预置 `/run/systemd/resolve/resolv.conf` 软链（否则 pod sandbox 创建失败）
-   - 时钟：chrony；UDP123 被封则部署 HTTP-Date 兜底 timer。装完必查 `date -u`（偏 8h → GitHub App JWT 401、listener 无限崩）
-   - 镜像预缓存：pause、CNI、runner、busybox；legacy 业务还要求节点预置 `imagePullPolicy: Never` 的镜像
-   - 验收（只读）：`date -u`、`npu-smi info`、`kubectl get node -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.allocatable}{"\n"}{end}'`、`crictl images`
-5. 网络与存储：
-   - CNI 模式按拓扑选（VPN/多网卡不要硬上 native routing）；lab 节点补 SNAT/masquerade
-   - 安全组：10250、CNI 端口（4240/8472）、NodePort 段
-   - 按 share 名准备 NFS/SFS 导出，并挂/bind 成 `/mnt/sfs-local/<share>`（**名字要与既有集群一致**，Liqo 按名字映射）
-   - 若沿用"缓存单点"模式：给缓存节点打 `cache=true` label（±污点，各集群不一致，按 cluster.yaml 决定）
-
-## 阶段 2：平台组件（按依赖顺序，每步验收再下一步）
-
-6. ArgoCD 侧先做两件事：注册集群 cluster secret（destination 名 = cluster.yaml）；**把 AppProject 写进 Git**（当前仓库里没有任何 AppProject 定义，属隐性依赖）。
-7. 安装顺序（依赖列推导出的拓扑序）：
-
-   1. S19 SWR + pull secret（几乎所有组件硬引用该 secret 名，最先做）
-   2. S23 时钟/DNS、S18 白名单（工单类，并行推进）
-   3. S3 驱动 + Device Plugin → 校验资源名
-   4. S20 Vault / secret-manager（Vault 侧 KV 必须已有内容）
-   5. S13 squid（`caNamespaces` 列全所有消费方 ns，含 gitcode 租户）
-   6. S14 nginx-pypi-cache（**svc 名与端口必须与现网一致**；容量按本集群核定，不许照抄）
-   7. S16 gh-proxy 可达性验证 → S15 git-cdn（单副本；需要 gitcode 再加一份实例或 smart-git-proxy）
-   8. S11 sfs-local-provisioner（要 `cceaddon-volcano` 豁免标签）→ S9 共享缓存盘 / S10 权重盘 / S12 work PVC
-   9. S4 npu-scheduler → S5 volcano + Queue → S6 LWS
-   10. S7 Liqo（consumer/provider 二选一或both；两侧 `networking.enabled` 一致）
-   11. S8 Karpenter（**先给 runner 加 toleration，再给 NodePool 加污点**）
-   12. S1 ARC controller（镜像架构匹配，0.14.201 仅 amd64）
-   13. S21 buildkitd（需 S20 证书 + S13 CA 分发到 buildkitd ns + `devic.es/fuse` + 节点 seccomp profile）
-   14. S22 观测与治理：node-exporter（静态 IP 列表）→ kube-state-metrics → prometheus-agent（出口被掐则装 pushgateway-local，**版本 v1.10.x**）→ npu-exporter-ascend → zombie-runner-cleanup → **补装 `model-cache-cleanup`、`nginx-conf-drift`（现网无 GitOps 清单，最容易漏）**
-   15. 验收（只读）：`kubectl -n squid|nginx-pypi-cache|git-cdn|buildkitd get svc,pods`、`kubectl get sc`、`kubectl get nodes -o custom-columns=NAME:.metadata.name,TAINTS:.spec.taints`
-
-## 阶段 3：业务接入（按总表逐列）
-
-8. 建 `projects/<org>/<repo>/config-for-<cluster>/`（namespace、PVC、RBAC、PodTemplate ConfigMap）+ `linux-<arch>-<npu>-<n>-<cluster>/values.yaml` + `argocd/clusters/<cluster>/*.yaml`；runner 标签登记进 runner-name 手册（`check-projects-coverage.py` 的 RA/RC 门禁会拦）
-9. 用 `scripts/squid-injection.py inject <runner_dir>` 注入代理与 CA（**同时改 values.yaml 和 job PodTemplate**，只改前者 = job 仍直连），再 `check` 做回归
-10. 补凭据与盘：`obs-cache-secret`、`github-app-secret.yaml`（Vault 里先有 key）、共享盘/权重盘、legacy 栈的镜像预缓存
-11. GitHub 仓库侧 secrets/vars：`KUBECONFIG_*_B64`（含 cluster 级 `nodes` patch 那份）、`A2/A3_TAINT_NODES`、`SWR_USERNAME/PASSWORD`、`OBS_*`/`HW_OBS_*`、`QUAY_*`、`NIGHTLY_COMMAND_BLOCK_WINDOW`
-12. 模型/数据集预热：零卡 runner（`*-0`）+ 清单驱动下载，或 sync-tools 跨集群同步；云下用 `HF_ENDPOINT=hf-mirror.com`；完成后核对只读子目录（huggingface/modelscope）存在
-13. 时间窗协作落纸面：谁在什么时间打 `dedicated=night`、CI 何时摘（现网是集群侧打 + 业务 workflow 的 `remove-taints` 摘）
-
-## 阶段 4：验收与交付
-
-14. 冒烟 5 条，一条不能省：CPU lint job（S1+标签+S8）／单卡 NPU 测试（S3+S4+资源名）／多机 LWS（S5+S6+R1+S9）／走 squid 的 pip 安装 + docker build（S13+S20+S21+S19）／离线模型加载（S10+R4）
-15. 跑 doctor（只读体检）：污点全集、allocatable 资源名 vs 业务 requests、`/mnt/sfs-local` share 清单、各 svc 与端口可达性、拨测目标是否与业务实际用的代理一致（gy-001/wlcb 教训：探的是遗留 `git-cache-github:8080`）、清理类 CronJob 是否存在
-16. 回写文档：总表新增集群行/列、runner 标签手册、`cluster.yaml` 入 GitOps
+**常见失败**：`dcmi init failed -8255`（ADR/DCMI 版本不配套）｜pod sandbox 创建失败（resolv 软链缺失）｜apiserver 全部 CrashLoop（重签证书没合并旧 SAN）｜新节点镜像拉不到（没预缓存 + DNS 顺序错）。
 
 ---
 
-## 决策点清单（18 项：一次性参数 12 + 持续运营 6）
+## 3. L1 公共服务层（不区分社区）
 
-**一次性参数（填进 cluster.yaml 就能自动往下走）**
-1. 集群形态（全功能 / 纯 Provider / 纯出口）
-2. 承载业务清单（总表 23 列勾选）→ 决定 caNamespaces、Queue、标签、盘
-3. NPU 资源名口径（以 allocatable 实测为准）
-4. CNI 模式（tunnel vs native routing）
-5. 存储方案与 share 命名（是否沿用跨集群同名约定）
-6. nginx 缓存容量 `max_size`（每集群单独核定）
-7. squid registry 白名单 + urlRewrite 域清单
-8. squid CA 用 `_prod_pem` 还是试验田 key（跨集群复用会 TLS 失败）
-9. Queue capability / deserved 卡数配额
-10. Karpenter 机型/上限/是否带 `cpu-elastic` 污点
-11. ARC 版本与镜像架构（arm-only 不能用 0.14.201）
-12. 多机路线：装 LWS 还是走 RayJob（verl 那种）
+**输入**：storageClass 名、cache 节点 hostname、squid CA 的 Vault key、是否要 Liqo/Karpenter/buildkitd。
 
-**持续运营（脚本只能执行，不能替决策）**
-13. 时间窗归属：谁打污点、什么时间、谁兜底摘除
-14. 出网白名单范围：NGFW 域名清单、中心监控放行 IP
-15. 驱动/ADR/DCMI/Device Plugin 版本矩阵确认
-16. Vault KV 内容由谁录入、GitHub App 授权范围
-17. 是否支持 legacy 业务（`imagePullPolicy: Never` → 节点预缓存策略）
-18. 放行标准：冒烟 5 条是否作为上线门槛
+**安装顺序（依赖决定，不可乱序）**
 
-## 可脚本化清单（41 项：现成 9 / 需新写 12 / 半自动 14 / 纯人工 6）
+| 序 | 装什么 | 关键约束 | 验收 |
+|---|---|---|---|
+| 1 | S19 SWR pull secret | 名字必须是 `huawei-swr-image-pull-secret-model-gy`，下游全硬引用 | 任一 ns 里 `kubectl get secret` 可见 |
+| 2 | S20 vault / secret-manager | Vault 侧 KV 内容先有；AppRole Secret 预建 | SecretDefinition 能生成 Secret |
+| 3 | S13 squid | 独占 cache 节点；`caNamespaces` 里的 ns 必须已存在；CA 指纹要与客户端一致 | 集群内 `curl -x squid-cache.squid:3128 https://pypi.org` 200 |
+| 4 | S14 nginx-pypi-cache | svc 名与端口原样复刻；容量按本集群核定；hostPath 形态要同删 PVC | `curl cache-service.../pypi/simple/` 有 `X-Cache` |
+| 5 | S16 gh-proxy 可达性 → S15 git-cdn | git-cdn **必须单副本**；SFS 用 RWX，无 SFS 就关持久化 | `git ls-remote` 经 `:8000` 前缀成功 |
+| 6 | S11 sfs-local-provisioner + storageClass | 必须带 `cceaddon-volcano` 豁免标签；排除 liqo 虚拟节点 | 节点上 `ls /mnt/sfs-local/` 见 share 目录 |
+| 7 | S3 设备 + S4 npu-scheduler + S5 volcano + Queue + S6 LWS | **LWS 现网只有 gy-003 有清单**，要多机就得显式补装 | `kubectl api-resources | grep -i leaderworkerset` |
+| 8 | S7 Liqo（如需） | 两侧 `networking.enabled` 一致；provider 侧 app 不要 `CreateNamespace=true` | 虚拟节点出现且 `curl` apiServer 返 401 |
+| 9 | S8 Karpenter NodePool（如需） | **先给 runner 加 toleration，再给 NodePool 加污点** | NodePool Ready，弹性节点带污点 |
+| 10 | S1 ARC controller | 镜像架构匹配（0.14.201 仅 amd64） | `kubectl get pods -n arc-systems` |
+| 11 | S21 buildkitd（如需） | 依赖 S20 证书 + S13 CA 分发到 buildkitd ns + `devic.es/fuse` + 节点 seccomp profile | `buildctl debug workers` 有节点 |
+| 12 | S22 观测与清理组件 | node-exporter 用静态 IP 列表；被 NGFW 挡则装 pushgateway-local（**必须 v1.10.x**）；**补装 `model-cache-cleanup`、`nginx-conf-drift`（现网无 GitOps 清单）** | 中心 Prometheus 能查到该集群 up=1 |
 
-**已现成，直接可用**：helm+kustomize 装 22 项 infra ｜ `squid-injection.py`（audit/inject/revert/check）｜ `argocd-app-lint.sh` ｜ `check-projects-coverage.py`（RA/RC）｜ `tests/`（配置漂移、toleration 断言）｜ `nginx-cache-rollout-gate.py`（发布门禁）｜ monitoring overlay 模板 ｜ `resource-deploy-core`（节点探测/join/软件下发/TTL 清理）｜ GitOps 同步本身
+**公共冒烟（6 条，与任何社区无关）**
 
-**需要新写（一次写好长期复用）**：`cluster.yaml` schema+校验器 ｜ ApplicationSet / root-app 生成器（**当前仓库 0 个 root app、0 个 ApplicationSet、0 个 AppProject 定义**）｜ 每集群 values 渲染（SC/cache 节点/CA key/镜像 tag/toleration）｜ sync-wave 顺序编排 ｜ `new-cluster-doctor.py`（只读体检）｜ 冒烟触发与结论汇总 ｜ GitHub secrets/vars 批量下发 ｜ Vault 写入脚本 ｜ AppProject 模板化 ｜ 装机 playbook（containerd 双格式、resolv 软链、时钟兜底、镜像预缓存清单）｜ `model-cache-cleanup`/`nginx-conf-drift` 补 GitOps ｜ runner 标签手册自动登记
+1. 临时 pod 走 squid 访问公网 + 校验 CA（`SSL_CERT_FILE` 指向合并 bundle 后 `curl https://pypi.org` 不报证书错）。
+2. `pip install -i http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple --trusted-host <同域>` 成功且命中缓存。
+3. `git clone https://github.com/<公开仓>` 经 git-cdn insteadOf 成功，不出现 TLS 超时断连。
+4. `buildctl build` 出一个 hello 镜像并推到 SWR。
+5. 申请 1 张 NPU 的 pod 能 Pending→Running，容器内 `npu-smi info` 有输出。
+6. 中心能看到该集群指标与拨测数据（无 ProbeStale）。
 
-**半自动（脚本能起草，但要云 API 权限或工单）**：SFS/EVS 建盘与 share-id ｜ ELB/EIP + certSANs 重签 ｜ 安全组端口 ｜ NGFW 域名白名单申请 ｜ 中心 CN4 放行 ｜ Harbor/SWR 命名空间与机器人账号 ｜ Vault 服务端 policy/role（`buildkitd` SA 名不可改）｜ Liqo 两侧 peer 与可达性验证 ｜ 集群注册进 ArgoCD ｜ 模型权重重下载/跨集群同步 ｜ 驱动与 device plugin 装机 ｜ 节点 label/taint 初始化 ｜ NFS 目录预导出+chmod ｜ 只读缓存子目录核对
+**常见失败**：squid CA 用了另一套 key（试验田 vs prod）→ 全链路 TLS 失败；改 nginx conf 没更新 `checksum/nginx-conf` → pod 不滚动、配置不生效；多副本 git-cdn/smart-git-proxy → packfile 与 refs 损坏；cordon 被自动解除导致服务落回退役节点（要用 nodeAffinity NotIn）。
 
-**纯人工/流程**：业务清单与配额谈判 ｜ 时间窗归属 ｜ 版本矩阵确认 ｜ 发布批准 ｜ gitcode 租户诉求收集（总表 14–23 列的 `?`）｜ 验收签字
+---
 
-**一句话结论**：先做"需要新写"里的前 5 项（schema、ApplicationSet、doctor、冒烟、secrets 下发），手工动作可从 ~40 次降到 ~8 次；剩余瓶颈是那 14 个云 API/工单类动作 —— 属日历时间，必须 T-7 天前发起，写脚本也不会变快。
+## 4. L2 社区接入层（每社区一次）
+
+**输入**：社区要哪些集群、卡数与规格、需要哪些模型/数据集、是否需要独立卡池。
+
+**步骤**
+
+1. 建社区 ns + `runner-pod-permission`（SA + Role：pods/pods-exec/pods-log/jobs/secrets，**同 ns 多社区时不要重复声明 ns/RBAC**，会被两个 Application sync-prune 互抢）。
+2. 建共享缓存盘：PVC 或 hostPath `/mnt/sfs-local/<share>`；**share 名沿用跨集群同名约定**（Liqo 按名字映射，名字错位 = offload pod 永久卡死）。
+3. 权重/数据集同步：用零卡 runner（`*-0`）跑清单下载，或 `sync-tools` 跨集群复制；云下 `HF_ENDPOINT=hf-mirror.com`，HK 直连 huggingface；大文件下载可另起长跑 pod 并用 `tc` 限速（需 privileged）。
+4. Queue 配额：capability / deserved 按社区谈定（deserved 就是预留卡数）。
+5. 卡池归属：是否需要 `dedicated=night`、`752t`、`single-node` 等污点池，以及谁在什么时间打/摘。
+6. **登记台账**（下表）：社区、集群、盘名、权重是否就绪、确认人。
+7. 把社区 ns 追加进 squid 的 `caNamespaces`（ns 必须已存在，否则 SecretDefinition 报错）。
+
+**出门条件**：台账该行"权重就绪 = 是"；抽查 `ls /root/.cache/modelscope/hub/models` 或 `ls /root/.cache/huggingface/hub` 命中；否则该社区的离线类用例不开放。
+
+**常见失败**：只读试点 runner 只挂 `huggingface/`、`modelscope/` 子目录，盘上目录结构不对就整片失败；NFS 上 `fcntl.flock` 不互斥，多 pod 并发写缓存有风险；SFS 的 `everest.io/reclaim-policy` 注解实测不生效，PV 落 Delete，**部署后要手工 patch Retain**。
+
+**社区层接入台账**（现网已取证，新集群照此续填）
+
+| 社区 | 集群 | 共享盘 / 权重通道 | 权重就绪 | 状态 |
+|---|---|---|---|---|
+| vllm-project（vllm-ascend、vllm-omni、nv-action fork） | gy-001/005、hk-001、cn12、sh-001、gy-003/006 | `vllm-ascend-az5`、`gy005-az5-vllm-ascend-v2`、`vllm-project-hk001`、`nv-action-vllm-benchmarks-v2/-v3`、`/mnt/weight`、`/mnt/share` | 是（清单 `misc/model_dataset_list.json` 驱动，a2/a3/310p/a5 分池） | 已登记；大盘被 5+ 社区共用 |
+| sgl-project（sglang、sglang-omni、sgl-kernel-npu）+ Ascend/sglang | hk-001、cn12、gy-004、sh-002 | `sgl-project-sglang-v2/-v3`、`sglang-guiyang004`、`ascend-ci-share-pkking-sglang`、`...-liqo-v2`、`/data` | 是（用例硬编码 modelscope 绝对路径） | 已登记；sh-002 走自建 NFS |
+| volcengine（verl、uni-agent、verl-SpeCo、verl-omni） | hk-001、mind-third-ci、verl-suzhou、cn12、gy-001 | `hk001-v1`、`verl-hb003`、`verl-project-liqo-cn12-001-v2`、`/nfs/verl_ci` | 是（含只读试点 runner） | 已登记；三集群同名 hostPath 约定 |
+| Ascend（pytorch、sglang、cann-container-image、docs、ray-ascend） | cn12、aiframework、gy-005、sh-002、gy-001、hk-001 | `ascend-ci-share-pkking-pytorch`、`ascend-pytorch-share-pvc`、`ascend-cann-container-image`；产物走 `obs://pytorch-ci-cache` | 是 | 已登记 |
+| triton-lang（+ 个人 fork） | cn12、hk-001、gy-001、gy-005、sh-002 | `ascend-triton-ascend-gy005/hk001`、`triton-ascend-cn12-001-pvc` | 是（大文件走 OBS 非权重盘） | 已登记 |
+| tile-ai（tilelang、mlir-ascend） | sh-002、cn12 | `tile-ai-tilelang-share-pvc`、自建 NFS、`tile-ai-tilelang-ascend-gy005` | 不适用（不用远端缓存，依赖宿主 tool_cache + ccache） | 已登记；新集群必须给本地大盘 |
+| alibaba/ROLL、areal/AReaL | cn12 | `alibaba-roll-cn12-001`、`...-liqo-cn12-001-v2`、`areal-project-areal-shared-v3` | 是 | 已登记 |
+| HK a2 系（fla-org、hiyouga、modelscope、pt-ecosystem、UsernameFull） | hk-001 | `hk001-v1`（多社区共用整盘）、`fla-org-...-a2-hk-001` | 是 | 已登记；同盘并发写有 flock 风险 |
+| 平台/组织级（ascend-gha-runners、cosdt、GanDing、opensourceways、agentic） | 13+ 集群 | `ascend-ci-share-ascend-gha-runners`、`ascend-gha-runners-gy001`、`cosdt-ci-test-gy001`、`opensourceways-gy001`、gy-006 静态 PV | 部分 | 已登记；`sync-tools` 是同步执行者 |
+| gitcode / 内部租户（mindspeed 系、megatron、op-plugin、cann、fsdpturbo、memfabric/memcache、六个 SDK + mindstudio、slime-ascend、openubmc、ascend-datasync、argo） | gy-001、gy-002、wlcb-001 | 待登记 | 待登记 | **缺口**：集群侧只能证明它们拿到 squid CA；从 wlcb 的 `ascend-datasync` 要台账最快 |
+
+---
+
+## 5. L3 项目接入层（每 org/repo）
+
+**步骤**
+
+1. `projects/<org>/<repo>/config-for-<cluster>/`：PodTemplate ConfigMap、PVC、`github-app-secret.yaml` 或 `github-token-secret.yaml`。
+2. `linux-<arch>-<npu>-<n>-<cluster>/values.yaml`：runner scale set；ARC ≥0.14 必须两个 `scaleSetLabels`；标签与 `runs-on` 严格一致。
+3. 登记 runner 标签到手册（`check-projects-coverage.py` 的 RA/RC 会拦未登记与无 app 的目录）。
+4. `scripts/squid-injection.py inject <runner_dir>`：同时注入 `values.yaml` 与 job PodTemplate（只注入前者 = job 仍直连），再跑 `check`。
+5. git insteadOf（git-cdn 或 gh-proxy，按该集群实际有的代理）、`OBS` 凭据（`obs-cache-secret`）、需要的 `huawei.com/schedule_policy` 注解。
+6. GitHub 仓库侧 secrets/vars：`KUBECONFIG_*_B64`、`A2/A3_TAINT_NODES`、`SWR_USERNAME/PASSWORD`、`OBS_*`/`HW_OBS_*`、`QUAY_*`、`PAT_TOKEN`、`NIGHTLY_COMMAND_BLOCK_WINDOW`。
+7. `argocd/clusters/<cluster>/` 建 config + runner Application，等同步绿。
+8. 冒烟：按业务挑适用子集（CPU lint / 单卡 NPU / 多机 / 走代理的构建 / 离线权重加载）。
+
+**出门条件**：RA/RC 通过 + 冒烟绿 + 中心无该 ns 的 Pending/CrashLoop 告警。
+
+**常见失败**：手动 `kubectl patch` 的字段（如 `maxRunners=0`）不在 values 里，重部署即丢失；helm uninstall 重装会让 GitHub 注册新 runner ID、旧 job 变孤儿（改配置只能 upgrade）。
+
+---
+
+## 6. L4 运营层（持续）
+
+- 时间窗：夜间/整机池按约定打污点与摘除；摘污点现网由业务 workflow 执行（`kubectl taint nodes $A2/A3_TAINT_NODES dedicated-`），打污点在集群侧 —— **归属必须写在集群文档里，不能靠口口相传**。
+- 发布：缓存/代理组件走 `nginx-cache-rollout-gate.py`（fail-closed：查不到状态就不放行）；新逻辑先进 gy-006 试验田观察 ≥3 天。
+- 清理：僵尸 runner（15 分钟一次，保留 `--wait=false`）、模型缓存（周二 19:00，atime 90 天规则）。
+- 告警：新集群必须在中心有拨测与规则；注意 `severity: warning` 是黑洞、拨测类要配 `ProbeStale` 兜底。
+- 台账：新社区接入即追加一行，权重就绪状态由社区负责人签字确认。
+
+---
+
+## 7. 决策点（18 项，标好该在哪一层拍板）
+
+| 层 | 决策点 |
+|---|---|
+| L0 | ① CNI 模式（tunnel/native）② 存储方案与 share 命名（是否沿用同名约定）③ NPU 资源名口径（以 allocatable 实测为准）④ 驱动/ADR/DCMI/Device Plugin 版本矩阵 |
+| L1 | ⑤ squid registry 与 urlRewrite 白名单 ⑥ squid CA 用 prod 还是试验田 key ⑦ nginx 容量 `max_size`（每集群核定）⑧ 是否装 LWS（多机路线：LWS vs RayJob）⑨ ARC 版本与镜像架构（arm-only 不能用 0.14.201）⑩ 出网/入网白名单范围（NGFW 域名、中心放行 IP） |
+| L2 | ⑪ 承载社区清单（总表 23 列勾选）⑫ Queue capability/deserved 配额 ⑬ 是否给独立卡池与时间窗归属 ⑭ 是否支持 legacy 业务（`imagePullPolicy: Never` → 节点预缓存） |
+| L3 | ⑮ Vault KV 内容由谁录入、GitHub App 授权范围 ⑯ 仓库 secrets/vars 由谁下发 |
+| L4 | ⑰ 发布窗口批准权 ⑱ 放行标准（冒烟 5 条是否作为上线门槛） |
+
+## 8. 自动化清单（41 项，按层归位）
+
+| 层 | 已现成 | 需新写 | 半自动（云 API/工单） | 纯人工 |
+|---|---|---|---|---|
+| L0 | `resource-deploy-core`（节点探测/join/软件下发/TTL 清理）；现网装机模板 | 装机 playbook（containerd 双格式、resolv 软链、时钟兜底、镜像预缓存清单固化） | ELB/EIP+certSANs、安全组、NGFW 放行、中心监控放行、SFS/EVS 建盘、NFS 预导出+chmod、驱动与 device plugin 装机、节点 label/taint 初始化 | 版本矩阵确认 |
+| L1 | helm+kustomize 的 22 项 infra、`argocd-app-lint.sh`、`tests/` 断言、`nginx-conf-drift`、GitOps 同步 | `cluster.yaml` schema+校验、ApplicationSet/root-app 生成器、每集群 values 渲染、sync-wave 编排、`new-cluster-doctor.py`、公共冒烟脚本、`model-cache-cleanup`/`nginx-conf-drift` 补 GitOps | Harbor/SWR 命名空间与机器人账号、Liqo 两侧 peer 与可达性验证、集群注册进 ArgoCD、Vault 服务端 policy/role | CA/registry 白名单拍板、nginx 容量核定 |
+| L2 | `sync-tools` runner、`install-docker-cli` 预热 Job 模式、`check-projects-coverage.py` | 台账登记工具（表 → Git）、权重就绪抽查脚本 | 权重重下载/跨集群同步、只读子目录核对 | 配额谈判、卡池归属 |
+| L3 | `squid-injection.py`（audit/inject/revert/check）、RA/RC 门禁 | GitHub secrets/vars 批量下发、Vault 写入脚本、Obs/凭据模板生成 | — | 授权范围决定 |
+| L4 | `nginx-cache-rollout-gate.py`、zombie-runner-cleanup | 时间窗自动打/摘污点控制器（可写，但要先定归属） | — | 发布批准、验收签字 |
+
+**投入产出**：先做 L1 的 `cluster.yaml` schema + ApplicationSet + doctor + 冒烟脚本 + secrets 下发这 5 件，手工动作可从约 40 次降到约 8 次；剩下的瓶颈是 14 个云 API/工单类动作，属日历时间，写脚本也不会变快。
+
+## 9. 只读体检（doctor）项
+
+按顺序核对，任一不过就回到对应层：
+
+1. 节点 Ready、arch/OS 正确、`date -u` 一致
+2. `allocatable` 的 NPU 资源名 = 业务 requests 用名
+3. 污点全集 = 集群文档约定（`dedicated`、`cache`、`single-node`、`cpu-elastic`、`node.usage.notes`）
+4. `kubectl get sc` 与 `/mnt/sfs-local/` 实际 share 清单齐全（跨集群同名的都对上）
+5. squid / nginx / git-cdn / buildkitd 的 svc 与端口可达，且 CA 指纹与客户端一致
+6. 拨测 `GH_PROXY_URL` 指向的是业务**实际在用**的代理（gy-001/wlcb 教训：探的是遗留 `git-cache-github:8080`）
+7. NetworkPolicy 与 CoreDNS forward 现状符合预期（现网多数集群靠安全组，无 NetworkPolicy）
+8. 清理类 CronJob 存在：`zombie-runner-cleanup`、`model-cache-cleanup`、`nginx-conf-drift`
+9. 中心能查到该集群指标（无 ProbeStale / 无上报失明）
+10. GitHub 仓库侧 secrets/vars 齐全，runner 标签已在手册登记
