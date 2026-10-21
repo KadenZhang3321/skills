@@ -66,7 +66,7 @@ date -u                                               # 每台节点都对
 | 4 | S14 nginx-pypi-cache | svc 名与端口原样复刻；容量按本集群核定；hostPath 形态要同删 PVC | `curl cache-service.../pypi/simple/` 有 `X-Cache` |
 | 5 | S16 gh-proxy 可达性 → S15 git-cdn | git-cdn **必须单副本**；SFS 用 RWX，无 SFS 就关持久化 | `git ls-remote` 经 `:8000` 前缀成功 |
 | 6 | S11 sfs-local-provisioner + storageClass | 必须带 `cceaddon-volcano` 豁免标签；排除 liqo 虚拟节点 | 节点上 `ls /mnt/sfs-local/` 见 share 目录 |
-| 7 | S3 设备 + S4 npu-scheduler + S5 volcano + Queue + S6 LWS | **LWS 现网只有 gy-003 有清单**，要多机就得显式补装 | `kubectl api-resources | grep -i leaderworkerset` |
+| 7 | S3 设备 + S4 npu-scheduler + S5 volcano + Queue + S6 LWS | **LWS 现网只有 gy-003 有清单**，要多机就得显式补装 | `kubectl api-resources --api-group=leaderworkerset.x-k8s.io` |
 | 8 | S7 Liqo（如需） | 两侧 `networking.enabled` 一致；provider 侧 app 不要 `CreateNamespace=true` | 虚拟节点出现且 `curl` apiServer 返 401 |
 | 9 | S8 Karpenter NodePool（如需） | **先给 runner 加 toleration，再给 NodePool 加污点** | NodePool Ready，弹性节点带污点 |
 | 10 | S1 ARC controller | 镜像架构匹配（0.14.201 仅 amd64） | `kubectl get pods -n arc-systems` |
