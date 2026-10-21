@@ -6,6 +6,54 @@
 
 ---
 
+---
+
+## 分层交付模型（新集群按层交付，层间设门禁）
+
+> 核心原则：**L1 公共服务一次装好、不区分社区；社区差异全部下沉到 L2；仓库差异全部下沉到 L3。**
+> 与上面阶段的对应关系：阶段 0–1 = L0，阶段 2 = L1，阶段 3 前半 = L2、后半 = L3，阶段 4 = L3/L4。
+
+**L0 底座（集群级，一次性）**
+节点装机：驱动 + ADR + Device Plugin、containerd（双格式镜像加速）、openEuler resolv 软链、chrony/HTTP-Date 兜底、镜像预缓存、CNI 模式、apiserver ELB + certSANs、安全组与 NGFW 域名白名单、SFS/NFS/ELB 等外部资源。
+门禁（全绿才进 L1）：`date -u` 正确｜`allocatable` 里 NPU 资源名已确定｜CoreDNS forward 可解析外部域｜squid 需要的出网域名已放行｜`kubectl get nodes` 无 NotReady。
+
+**L1 公共服务层（不分社区，装完全集群共享）**
+按序：`S19 pull secret` → `S20 vault/secret-manager` → `S13 squid`（`caNamespaces` 先给平台 ns，社区 ns 在 L2 追加）→ `S14 nginx-pypi-cache`（svc 名与端口原样复刻）→ `S16 gh-proxy 验证` → `S15 git-cdn`（单副本）→ `S11 sfs-local-provisioner` + storageClass → `S3/S4/S5/S6`（设备+调度栈，含 LWS）→ `S7 Liqo`（如需）→ `S8 Karpenter`（先容忍后污点）→ `S1 ARC controller` → `S21 buildkitd` → `S22 观测/清理组件`。
+门禁：**与任何社区无关的公共冒烟** —— 起一个临时 pod 依次验证：`curl -x squid` 通 + CA 校验通过、`pip install -i <cache-service>` 命中 `X-Cache`、`git clone https://github.com/...` 走 git-cdn 且非零速断连、`buildctl build` 成功、`nvidia/npu` 资源申请成功、中心能看到该集群指标。
+
+**L2 社区接入层（每个社区一次）**
+- 建社区 ns + **共享缓存盘**（hostPath `/mnt/sfs-local/<share>` 或 PVC，**命名沿用跨集群同名约定**）
+- **权重/数据集同步**：跑零卡 runner 或 `sync-tools` 把模型/数据集预置进盘；云下走 `hf-mirror.com`，HK 走 `huggingface.co`；完成后核对只读子目录（`huggingface/`、`modelscope/`）存在
+- Queue capability/deserved 卡数配额、是否要独立卡池（`dedicated=night`/`752t`/`single-node`）
+- **登记台账**（见下表）：哪个社区、在哪个集群、哪个 share、权重就绪与否、由谁确认
+- 门禁：台账该行"权重就绪 = 是" + 抽查一次 `ls /root/.cache/modelscope/hub/models` 命中；否则该社区的离线类用例不许开放
+
+**L3 项目接入层（每个 org/repo）**
+runner scale set（标签与 `runs-on` 严格一致 + 标签手册登记）→ RBAC/SA → `github-app-secret.yaml`/`github-token-secret.yaml`（Vault 侧先有 key）→ `obs-cache-secret` → `squid-injection.py inject`（values + job PodTemplate 双侧）→ `git insteadOf` → 仓库侧 secrets/vars → 冒烟。
+门禁：RA/RC 覆盖检查通过 + 该仓库冒烟任务绿。
+
+**L4 运营层（持续）**
+时间窗执行与摘除（谁打谁摘）、发布窗口门禁（`nginx-cache-rollout-gate.py`）、两类清理任务（runner 僵尸 / 模型缓存）、告警值班、**台账维护与新社区追加**。
+
+---
+
+## 社区层接入台账（现网已取证部分，新集群照此填写）
+
+| 社区 | 集群 | 共享缓存盘（`/mnt/sfs-local/<share>` 或 PVC） | 权重/数据通道 | 离线依赖 | 状态 / 缺口 |
+|---|---|---|---|---|---|
+| vllm-project（vllm-ascend、vllm-omni，含 nv-action fork） | gy-001、gy-005、hk-001、cn12、gy-003、gy-006、sh-001 | `vllm-ascend-az5`、`gy005-az5-vllm-ascend-v2`、`vllm-project-hk001`、`nv-action-vllm-benchmarks-v2/-v3`、公共大盘 `ascend-ci-share-nv-action-vllm-benchmarks` | `/mnt/weight`、`/mnt/share`（sh-001/002 系）；`modelscope download` 清单 `misc/model_dataset_list.json`（a2/a3/310p/a5 分池） | vllm-omni `HF_HUB_OFFLINE=1`；vllm-ascend `VLLM_USE_MODELSCOPE` | 已登记。**大盘被 5+ 社区共用**，新集群要按公共盘对待 |
+| sgl-project（sglang、sglang-omni、sgl-kernel-npu）+ Ascend/sglang | hk-001、cn12、gy-004、sh-002 | `sgl-project-sglang-v2/-v3`、`sglang-guiyang004`、`ascend-ci-share-pkking-sglang`、`sgl-project-sgl-kernel-npu-liqo-v2`、`sglang-npu-sglang-v2/-v3` | `/data`（CPU job 缓存）；性能用例硬编码 `/root/.cache/modelscope/hub/models/...` 绝对路径 | 未见 `HF_HUB_OFFLINE`，但用例路径依赖预置 | 已登记。sh-002 走自建 NFS（`179.130.11.2`） |
+| volcengine（verl、uni-agent、verl-SpeCo、verl-omni） | hk-001、mind-third-ci、verl-suzhou、cn12、gy-001 | `hk001-v1`（整盘）、`verl-hb003`、`verl-project-liqo-cn12-001-v2`、`verl-uni-agent-hk001`、`verl-verl-speco-hk001`、`verl-project-verl-omni-gy001` | `/nfs/verl_ci`（suzhou）；数据集断言 `modelscope/hub/datasets/...` | ModelScope（`ms=Y`）+ 只读试点 runner（只挂 huggingface/modelscope 子目录） | 已登记。**三集群同名 hostPath 约定**，gy004 曾因名字错位卡死 |
+| Ascend（pytorch、sglang、cann-container-image、docs、ray-ascend） | cn12、aiframework、gy-005、sh-002、gy-001、hk-001 | `ascend-ci-share-pkking-pytorch`、`ascend-pytorch-share-pvc`、`gy005-az5-vllm-ascend-v2`、`ascend-cann-container-image`、`ascend-docs-cn12-001`、`hk001-v1` | `/data`；pytorch 产物走 `obs://pytorch-ci-cache` | — | 已登记。sh-002 自建 NFS |
+| triton-lang/triton-ascend（含 TecJesh、xuedinge233 fork） | cn12、hk-001、gy-001、gy-005、sh-002 | `ascend-triton-ascend-gy005`、`ascend-triton-ascend-hk001`、`triton-ascend-cn12-001-pvc`、`ascend-ci-share-nv-action-vllm-benchmarks` | 大文件走 OBS（Bisheng 编译器、wheel），非权重盘 | — | 已登记 |
+| tile-ai（tilelang、tilelang-mlir-ascend） | sh-002、cn12 | `tile-ai-tilelang-share-pvc`、`tile-ai-tilelang-ascend-gy005`、自建 NFS | — | 明确不用远端缓存，靠宿主 `runner.tool_cache` + ccache | 已登记。新集群需给本地大盘，否则退化裸编译 |
+| alibaba/ROLL、areal-project/AReaL | cn12 | `alibaba-roll-cn12-001`、`alibaba-roll-liqo-cn12-001-v2`、`areal-project-areal-shared-v3` | — | — | 已登记（AReaL 整盘挂载） |
+| HK a2 系（fla-org、hiyouga、modelscope、pt-ecosystem、UsernameFull） | hk-001 | `hk001-v1`（多社区共用整盘）、`fla-org-flash-linear-attention-a2-hk-001` | `MODELSCOPE_CACHE`；`HF_TOKEN`+`hf-mirror` | — | 已登记。**同盘并发写 → NFS flock 不互斥风险** |
+| 平台/组织级（ascend-gha-runners、cosdt、GanDing、opensourceways、agentic、cosdt-ci-test） | 13+ 集群 | `ascend-ci-share-ascend-gha-runners`、`ascend-gha-runners-gy001`、`ascend-gha-runners-vllm-ascend-gy006`、`cosdt-ci-test-gy001`、`opensourceways-gy001`、`ganding-rlinf-a2-hk-001`、`ascend-ci-share-cosdt`、gy-006 静态 PV `pvc-<uuid>` | `/mnt/weight`（sh-001）；`sync-tools` 是跨集群同步的执行者（`nv-action-vllm-benchmarks-v3`、`sgl-project-sglang-v2`） | — | 已登记 |
+| **gitcode / 内部租户（mindspeed 系、megatron-adaptor、op-plugin、cann、fsdpturbo、memfabric/memcache、六个 SDK + mindstudio、slime-ascend、openubmc、ascend-datasync、argo）** | gy-001、gy-002、wlcb-001 | **待登记** | 待登记；wlcb 的 `ascend-datasync` ns 看名字就是专职数据同步，可先从它要台账 | 待登记 | **最大缺口**：集群侧只能证明它们拿到 squid CA，其余需各团队给清单 |
+
+---
+
 ## 阶段 0：定形态与唯一输入（纸面，1 天）
 
 1. **选集群形态**（决定装不装 ARC/vault/buildkitd）：
