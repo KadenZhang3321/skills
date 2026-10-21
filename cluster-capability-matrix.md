@@ -1,5 +1,6 @@
 # 集群能力 × 业务诉求 总表（为新集群"任务进去就能跑"）
 > 配套文档：接入步骤与决策点/可脚本化清单见 `RUNBOOK-new-cluster.md`
+> 说明：文中 `/root/...` 为取证时的本地运维机路径；`ascend-ci-deployment` = https://github.com/opensourceways/ascend-ci-deployment
 
 **图例**：`●●` 硬依赖（缺了跑不起来，配置里硬编码）｜`●` 需要（有兜底/只影响速度）｜`▲` 该业务特有｜`—` 不适用｜`?` 待取证
 **业务列**：1–13 = GitHub 仓库 CI（证据：`ascend-ci-deployment/projects|other` + 各仓库 `.github/workflows`、`.buildkite`）；14–23 = **gitcode / 内部仓库租户**（证据：`argocd/clusters/squid-rpardini/values-{gy-001,gy-002,wlcb-001}.yaml` 的 `caNamespaces` 名单 —— 这些命名空间不是本仓库部署的，其 CI 定义在 gitcode/内部流水线，本地无仓库，故多数格为 `?`，需向对应团队收一次诉求清单）
@@ -8,9 +9,7 @@
 ## 服务与诉求速查（先看懂这些，再查总表）
 
 | 编号 | 用途 / 目的（一句话） | 缺了或做错会怎样（现网实证） | 依赖关系（前置 → 被依赖） |
-|> 说明：文中 `/root/...` 为取证时的本地运维机路径；`ascend-ci-deployment` = https://github.com/opensourceways/ascend-ci-deployment
-
----|---|---|---|
+|---|---|---|---|
 | S1 ARC 自托管 runner | 把 GitHub Actions 的 job 落到 K8s + NPU 节点上执行 | 没有它 CI 无处运行；`runs-on` 标签与 scale set 标签不一致 → job 永远 waiting | 前置：集群已注册到 ArgoCD 控制面 → S19（pull secret）→ S20（GitHub App 凭据）→ S4/S5（runner 落 NPU 时）｜被依赖：所有 GitHub 业务、R3、S22 |
 | S2 租户自建 CI 引擎（Argo 等） | 不走 GHA 的内部/gitcode 租户自带流水线，集群只供算力与出网 | 按 ARC 思路给这类集群装 runner 属于白装，需求方用不上 | 前置：租户自己带引擎（Argo/Woodpecker），只依赖 S3/S13/S17/S19｜被依赖：无（14–23 列 gitcode 租户走这条路） |
 | S3 NPU 驱动 + 设备插件（资源名） | 让 pod 能申请到具体的卡（`ascend-1980`/`npu`/`Ascend910`/`ascend-310`） | 资源名写错（曾写 `huawei.com/ascend-a5`）→ volcano 永久 Unschedulable；驱动/ADR/DCMI 版本不配套 → `dcmi init failed -8255` | 前置：阶段1 装机（驱动/固件/ADR 版本配套）+ containerd 配置｜被依赖：S4、S5、S6、S7、R7、几乎所有业务用例 |
