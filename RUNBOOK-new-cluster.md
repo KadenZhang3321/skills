@@ -1,6 +1,6 @@
 # 新集群接入 Runbook
 
-配套：`cluster-capability-matrix.md`（总表 + 速查表）。本文用的 `S*` / `R*` 代号与速查表一致。
+配套：`cluster-capability-matrix.md`（总表 + 速查表）；统一部署方案（App-of-Apps/ApplicationSet/共享 Chart）见 `DESIGN-unified-cluster-deployment.md`。本文用的 `S*` / `R*` 代号与速查表一致。
 编写全程只读；所有需要登集群的动作只给步骤和**只读**验收命令，由有权限的人执行。
 
 ## 0. 怎么用这份文档

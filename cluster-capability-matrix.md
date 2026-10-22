@@ -1,5 +1,5 @@
 # 集群能力 × 业务诉求 总表（为新集群"任务进去就能跑"）
-> 配套文档：接入步骤与决策点/可脚本化清单见 `RUNBOOK-new-cluster.md`
+> 配套文档：接入步骤与决策点/可脚本化清单见 `RUNBOOK-new-cluster.md`；App-of-Apps 统一部署方案见 `DESIGN-unified-cluster-deployment.md`
 > 说明：文中 `/root/...` 为取证时的本地运维机路径；`ascend-ci-deployment` = https://github.com/opensourceways/ascend-ci-deployment
 
 **图例**：`●●` 硬依赖（缺了跑不起来，配置里硬编码）｜`●` 需要（有兜底/只影响速度）｜`▲` 该业务特有｜`—` 不适用｜`?` 待取证
