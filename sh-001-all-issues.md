@@ -205,6 +205,13 @@ K8s：v1.32.13
 
 1. 验证节点 Ready + NPU 资源可见
 2. Device Plugin + NodeD pod Running
+3. 打基础标签：`node-role.kubernetes.io/worker`、`workerselector=dls-worker-node`（后者是 Device Plugin DaemonSet 的 nodeSelector，必打）
+4. `accelerator` 标签**不要**在入集群时统一写成 `huawei-npu`，等设备插件注册资源后按实际芯片打：
+   - 节点 allocatable 出现 `huawei.com/npu`（Ascend950DT/PR，a5）→ `accelerator=huawei-npu`
+   - 出现 `huawei.com/Ascend910`（a3）→ `accelerator=huawei-Ascend910`
+   - 可用自动标签 `node.kubernetes.io/npu.chip.name` 交叉验证；`npu-smi info -t board` 不能用于判型（910 的驱动没有 Chip Name 字段，仅 950 系列驱动输出）
+
+   原因：不申请 NPU 的 runner（如 `linux-aarch64-a5-0`）全靠 `accelerator=huawei-npu` 这个 nodeSelector 把自己钉在 a5 机器上（见 ascend-ci-deployment PR #2191）。乱打标签会让 a5 runner 的 job 静默漂移到打错标签的机器上。
 
 ---
 
