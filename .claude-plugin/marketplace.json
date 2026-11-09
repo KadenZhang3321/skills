@@ -38,10 +38,10 @@
         "./skills/slack-gif-creator",
         "./skills/theme-factory",
         "./skills/web-artifacts-builder",
-        "./skills/webapp-testing"
+        "./skills/webapp-testing",
+        "./skills/ci-deployment-appofapps"
       ]
-    }
-    ,
+    },
     {
       "name": "claude-api",
       "description": "Claude API and SDK documentation skill for building LLM-powered applications",
