@@ -5,12 +5,33 @@ description: Use when planning or executing the migration of opensourceways/asce
 
 # ci-deployment App-of-Apps 改造方案
 
-> 适用仓库：`opensourceways/ascend-ci-deployment`
+> 适用仓库：
+>
+> - `opensourceways/ascend-ci-deployment`：生产集群（arc-prod、hk-001、cn12、gy-*、sh-* 等）
+> - `opensourceways/arc-fedsched`：test-01/02/03 等测试集群
 >
 > 盘点时间：2026-11-09。数字会变，执行前先重新跑 inventory。
 >
 > 核心原则：**迁移只改 ArgoCD Application 的归属和生成方式，不改 workload 的期望态。**
 > 任何会导致 Pod/DS/Deployment 重启的改动，都必须单独拆出来、单独验证。
+
+## 0. 仓库边界（硬约束）
+
+test 和 prod 不混在同一个仓库：
+
+| 环境 | 仓库 | 内容 |
+|---|---|---|
+| test-01/02/03 | `arc-fedsched` | test 的 appset、cluster-values、projects、bootstrap root |
+| 生产 | `ascend-ci-deployment` | 生产的 appset、cluster-values、projects、bootstrap root |
+
+两个仓库共用同一个 hub，但：
+
+- appset 对象名必须全局唯一：test 用服务名或 `test-` 前缀，生产统一 `arc-prod-` 前缀
+- 两个独立的 bootstrap root：
+  - `root-appsets-test` → `arc-fedsched/argocd/appsets`
+  - `root-appsets-prod` → `ascend-ci-deployment/argocd/appsets`
+- 本文档第 2 节的 33 个集群、1,014 个 Application 是 **ci-deployment 生产仓库**的盘点；test 仓库单独盘点，不要混算。
+- 不要为了“统一”把 test appset 放进 ci-deployment，也不要把生产 appset 放进 arc-fedsched。
 
 ## 1. 结论
 
@@ -27,7 +48,9 @@ description: Use when planning or executing the migration of opensourceways/asce
 
 ```
 Hub ArgoCD
-└── root-appsets                      # 一次 apply 的 bootstrap root
+├── root-appsets-test                # arc-fedsched/argocd/appsets
+│   └── test ApplicationSets
+└── root-appsets-prod                # ascend-ci-deployment/argocd/appsets
     └── ApplicationSets
         ├── platform/git-cdn
         ├── platform/nginx-pypi-cache
@@ -71,7 +94,7 @@ Hub ArgoCD
 ### 3.1 三层
 
 ```
-L0  root-appsets（hub bootstrap，一次 apply）
+L0  root-appsets-test / root-appsets-prod（每个仓库一个 hub bootstrap，一次 apply）
 L1  ApplicationSet catalog（平台服务 / runner 项目）
 L2  cluster-values / project-values（叶子，只写差异）
 L3  ArgoCD 生成的 Application → workload
@@ -87,7 +110,7 @@ L3  ArgoCD 生成的 Application → workload
 ```
 argocd/
 ├── bootstrap/
-│   └── root-appsets.yaml          # L0，hub 上 apply 一次
+│   └── root-appsets-prod.yaml     # 生产 L0；test 仓库对应 root-appsets-test.yaml
 ├── appsets/
 │   ├── platform/
 │   │   ├── git-cdn.yaml
@@ -325,10 +348,10 @@ template:
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: root-appsets
+  name: root-appsets-prod
   namespace: argocd
 spec:
-  project: hub-bootstrap
+  project: hub-bootstrap-prod
   source:
     repoURL: https://github.com/opensourceways/ascend-ci-deployment.git
     targetRevision: HEAD
@@ -346,10 +369,16 @@ spec:
       - CreateNamespace=true
 ```
 
+test 仓库同构，只是：
+
+- 名字 `root-appsets-test`
+- project `hub-bootstrap`
+- source `arc-fedsched/argocd/appsets`
+
 - 只需要在 hub 上手工 apply 一次。
 - 以后新增 appset 文件，merge 后 root 自动 apply；不需要人工 `kubectl apply -f argocd/appsets/...`。
 - root `prune: false`，避免删文件连带删服务；appset 自身用 `preserveResourcesOnDeletion: true`。
-- 如果 hub 上已有 `cluster-roots-prod` project，可以复用它；否则新建一个只允许 ApplicationSet/Application 的 `hub-bootstrap` project。
+- 生产 project 用 `hub-bootstrap-prod`，test 用 `hub-bootstrap`；不要复用 `cluster-roots`（它只放行 Application，不放行 ApplicationSet）。
 
 ## 8. 迁移 wave
 
